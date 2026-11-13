@@ -1,0 +1,44 @@
+name: MacBridge
+options:
+  bundleIdPrefix: com.habibtalib
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+packages:
+  BridgeCore:
+    path: Packages/BridgeCore
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Screen Recording and Accessibility grants are tied to the code signature,
+    # so builds must be signed with a stable identity, never ad hoc.
+    DEVELOPMENT_TEAM: 66G227SMR5
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+targets:
+  MacBridge:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: BridgeCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.habibtalib.macbridge
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: NO
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: MacBridge
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+schemes:
+  MacBridge:
+    build:
+      targets:
+        MacBridge: all
+    run:
+      config: Debug

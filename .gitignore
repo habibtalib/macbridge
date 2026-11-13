@@ -1,0 +1,13 @@
+.DS_Store
+build/
+DerivedData/
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.dmg
