@@ -11,6 +11,9 @@ import Testing
         .key(keyCode: 0xFFFF, isDown: false, modifiers: .max),
         .clipboard(text: "héllo 👋\nline two"),
         .clipboard(text: ""),
+        .nextDisplay,
+        .quality(.sharp),
+        .quality(.light),
     ])
     func roundTrips(_ message: InputMessage) throws {
         #expect(try InputMessage(decoding: message.encoded()) == message)
@@ -57,6 +60,12 @@ import Testing
         }
         #expect(throws: InputMessageError.unknownButton(7)) {
             try InputMessage(decoding: Data([1, 2, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1]))
+        }
+        #expect(throws: InputMessageError.unknownQuality(9)) {
+            try InputMessage(decoding: Data([1, 7, 9]))
+        }
+        #expect(throws: InputMessageError.tooShort) {
+            try InputMessage(decoding: Data([1, 7]))
         }
         #expect(throws: InputMessageError.invalidText) {
             try InputMessage(decoding: Data([1, 5, 0xFF, 0xFE]))

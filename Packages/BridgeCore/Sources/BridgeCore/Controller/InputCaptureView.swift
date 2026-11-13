@@ -104,6 +104,11 @@ public struct InputCaptureView: NSViewRepresentable {
         }
 
         private func key(_ event: NSEvent, isDown: Bool) {
+            // ⌘V pastes what is on *this* Mac's clipboard: send it ahead of the key.
+            if isDown, !event.isARepeat, InputMapping.isPaste(keyCode: event.keyCode, flags: event.modifierFlags),
+               let text = InputMapping.clipboardText(NSPasteboard.general.string(forType: .string)) {
+                send(.clipboard(text: text))
+            }
             send(.key(keyCode: event.keyCode, isDown: isDown, modifiers: InputMapping.wireModifiers(event.modifierFlags)))
         }
     }
@@ -122,6 +127,17 @@ public enum InputMapping {
     /// The modifier bits shared by AppKit and Core Graphics event flags.
     public static func wireModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
         UInt32(truncatingIfNeeded: flags.intersection([.capsLock, .shift, .control, .option, .command, .function]).rawValue)
+    }
+
+    public static func isPaste(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
+        keyCode == 9 && flags.intersection([.command, .control, .option]) == .command
+    }
+
+    /// Clipboard text worth sending: present, not empty, and small enough
+    /// for one message.
+    public static func clipboardText(_ text: String?) -> String? {
+        guard let text, !text.isEmpty, text.utf8.count <= InputMessage.maxClipboardBytes else { return nil }
+        return text
     }
 
     /// For a modifier key's own key code: whether that key is now held.

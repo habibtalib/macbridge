@@ -30,6 +30,29 @@ import Testing
         #expect(InputMapping.wireModifiers([.numericPad]) == 0)
     }
 
+    @Test func pasteIsCommandVOnly() {
+        #expect(InputMapping.isPaste(keyCode: 9, flags: [.command]))
+        #expect(InputMapping.isPaste(keyCode: 9, flags: [.command, .shift])) // paste and match style
+        #expect(!InputMapping.isPaste(keyCode: 9, flags: []))
+        #expect(!InputMapping.isPaste(keyCode: 9, flags: [.command, .control]))
+        #expect(!InputMapping.isPaste(keyCode: 8, flags: [.command])) // ⌘C
+    }
+
+    @Test func onlySendsClipboardTextThatFitsInOneMessage() {
+        #expect(InputMapping.clipboardText("hello") == "hello")
+        #expect(InputMapping.clipboardText(nil) == nil)
+        #expect(InputMapping.clipboardText("") == nil)
+        #expect(InputMapping.clipboardText(String(repeating: "x", count: InputMessage.maxClipboardBytes)) != nil)
+        #expect(InputMapping.clipboardText(String(repeating: "x", count: InputMessage.maxClipboardBytes + 1)) == nil)
+    }
+
+    @Test func qualityPresetsGetSmallerAndSlower() {
+        let presets = QualityPreset.allCases
+        #expect(presets.map(\.maxPixelWidth) == [2560, 1920, 1280])
+        #expect(presets.map(\.framesPerSecond) == [60, 30, 15])
+        #expect(zip(presets, presets.dropFirst()).allSatisfy { $0.maxPixelHeight > $1.maxPixelHeight })
+    }
+
     @Test func modifierKeyStateFollowsItsFlag() {
         #expect(InputMapping.modifierIsDown(keyCode: 55, flags: [.command]) == true)
         #expect(InputMapping.modifierIsDown(keyCode: 55, flags: []) == false)

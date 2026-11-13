@@ -31,6 +31,11 @@ public final class InputInjector: @unchecked Sendable {
         return AXIsProcessTrustedWithOptions(options)
     }
 
+    /// Points later events at another display (after the capture switched).
+    public func setDisplay(_ display: DisplayInfo) {
+        queue.async { self.display = display }
+    }
+
     public func handle(_ message: InputMessage) {
         queue.async { self.inject(message) }
     }
@@ -84,6 +89,9 @@ public final class InputInjector: @unchecked Sendable {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(text, forType: .string)
             }
+
+        case .nextDisplay, .quality:
+            break // capture settings, handled by the session owner
         }
     }
 

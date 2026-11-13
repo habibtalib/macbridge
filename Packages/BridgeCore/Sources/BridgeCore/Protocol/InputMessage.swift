@@ -12,15 +12,21 @@ public enum InputMessage: Equatable, Sendable {
     case scroll(dx: Float, dy: Float)
     case key(keyCode: UInt16, isDown: Bool, modifiers: UInt32)
     case clipboard(text: String)
+    /// Show the host's next display instead of the current one.
+    case nextDisplay
+    case quality(QualityPreset)
 
     public static let protocolVersion: UInt8 = 1
+    /// Largest clipboard text sent in one message; WebRTC data channel
+    /// messages are limited in size.
+    public static let maxClipboardBytes = 100_000
 
     /// Pointer moves and scrolls go on the unordered, no-retransmit channel:
     /// a late one is worthless, so it is dropped rather than queued.
     public var prefersUnreliableChannel: Bool {
         switch self {
         case .mouseMove, .scroll: return true
-        case .mouseButton, .key, .clipboard: return false
+        case .mouseButton, .key, .clipboard, .nextDisplay, .quality: return false
         }
     }
 }
@@ -31,6 +37,19 @@ public enum MouseButton: UInt8, Sendable {
     case middle = 2
 }
 
+/// How much of the host's screen detail and motion to send.
+public enum QualityPreset: UInt8, CaseIterable, Sendable {
+    /// Full detail, smooth motion. For good connections.
+    case sharp = 0
+    case balanced = 1
+    /// Smaller and slower, for weak connections.
+    case light = 2
+
+    public var maxPixelWidth: Int { [2560, 1920, 1280][Int(rawValue)] }
+    public var maxPixelHeight: Int { [1600, 1200, 800][Int(rawValue)] }
+    public var framesPerSecond: Int { [60, 30, 15][Int(rawValue)] }
+}
+
 public enum InputMessageError: Error, Equatable {
     case tooShort
     case unsupportedVersion(UInt8)
@@ -38,6 +57,7 @@ public enum InputMessageError: Error, Equatable {
     case unknownButton(UInt8)
     case invalidText
     case invalidCoordinate
+    case unknownQuality(UInt8)
 }
 
 private enum MessageType: UInt8 {
@@ -46,6 +66,8 @@ private enum MessageType: UInt8 {
     case scroll = 3
     case key = 4
     case clipboard = 5
+    case nextDisplay = 6
+    case quality = 7
 }
 
 extension InputMessage {
@@ -73,6 +95,11 @@ extension InputMessage {
         case let .clipboard(text):
             w.u8(MessageType.clipboard.rawValue)
             w.data.append(Data(text.utf8))
+        case .nextDisplay:
+            w.u8(MessageType.nextDisplay.rawValue)
+        case let .quality(preset):
+            w.u8(MessageType.quality.rawValue)
+            w.u8(preset.rawValue)
         }
         return w.data
     }
@@ -112,6 +139,12 @@ extension InputMessage {
                 throw InputMessageError.invalidText
             }
             self = .clipboard(text: text)
+        case .nextDisplay:
+            self = .nextDisplay
+        case .quality:
+            let raw = try r.u8()
+            guard let preset = QualityPreset(rawValue: raw) else { throw InputMessageError.unknownQuality(raw) }
+            self = .quality(preset)
         }
     }
 }

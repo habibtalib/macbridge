@@ -1,4 +1,5 @@
 import Combine
+import CoreGraphics
 import Foundation
 
 /// The app's state: the signaling connection, the paired devices, and at most
@@ -70,6 +71,8 @@ public final class BridgeModel: ObservableObject {
     private var injector: InputInjector?
     private let capturer = ScreenCapturer()
     private let power = PowerAssertions()
+    private var hostDisplay: DisplayInfo?
+    private var hostQuality = QualityPreset.sharp
     private var currentLogEntry: UUID?
     /// Newest request accepted from each device, to refuse replays.
     private var lastRequest: [String: Int64] = [:]
@@ -431,11 +434,22 @@ public final class BridgeModel: ObservableObject {
         do {
             // A sleeping display gives the capturer nothing to send.
             power.keepDisplayAwake = true
-            let display = try await capturer.start()
+            hostQuality = .sharp
+            let display = try await startCapture(on: nil)
             guard hostSession === session else { return } // replaced while starting
             let injector = InputInjector(display: display)
             self.injector = injector
-            session.onInput = { injector.handle($0) }
+            session.onInput = { [weak self] message in
+                switch message {
+                case .nextDisplay, .quality:
+                    Task { @MainActor in
+                        guard let self, self.hostSession === session else { return }
+                        await self.reconfigureCapture(message)
+                    }
+                default:
+                    injector.handle(message)
+                }
+            }
             capturer.onFrame = { [weak session] buffer, timestampNs in
                 session?.push(buffer, timestampNs: timestampNs)
             }
@@ -448,6 +462,38 @@ public final class BridgeModel: ObservableObject {
             send(.bye, to: peer)
             endHosting(notify: false)
         }
+    }
+
+    private func startCapture(on displayID: CGDirectDisplayID?) async throws -> DisplayInfo {
+        let display = try await capturer.start(
+            displayID: displayID,
+            maxPixelWidth: hostQuality.maxPixelWidth,
+            maxPixelHeight: hostQuality.maxPixelHeight,
+            framesPerSecond: hostQuality.framesPerSecond
+        )
+        hostDisplay = display
+        return display
+    }
+
+    /// The controller asked for another display or another quality.
+    private func reconfigureCapture(_ message: InputMessage) async {
+        var target = hostDisplay?.id
+        switch message {
+        case let .quality(preset):
+            guard preset != hostQuality else { return }
+            hostQuality = preset
+        case .nextDisplay:
+            guard let displays = try? await ScreenCapturer.displays(), displays.count > 1 else { return }
+            let index = displays.firstIndex { $0.id == hostDisplay?.id } ?? -1
+            target = displays[(index + 1) % displays.count].id
+        default:
+            return
+        }
+        let session = hostSession
+        guard let display = try? await startCapture(on: target), hostSession === session else { return }
+        // Nothing may stay held on the display being left.
+        injector?.releaseAll()
+        injector?.setDisplay(display)
     }
 
     /// Ends the session in which this Mac is being controlled.
@@ -463,6 +509,7 @@ public final class BridgeModel: ObservableObject {
         hostPeer = nil
         hostStatus = .idle
         power.keepDisplayAwake = false
+        hostDisplay = nil
         logSessionEnd()
         capturer.onFrame = nil
         injector?.releaseAll()
