@@ -37,7 +37,7 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         public var maxBitrateBps: Int
         public var maxFramerate: Int
 
-        public init(maxBitrateBps: Int = 20_000_000, maxFramerate: Int = 60) {
+        public init(maxBitrateBps: Int = 30_000_000, maxFramerate: Int = 60) {
             self.maxBitrateBps = maxBitrateBps
             self.maxFramerate = maxFramerate
         }
@@ -100,6 +100,12 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         }
         super.init()
         connection.delegate = self
+        // Start well above WebRTC's ~300 kbit/s default so the first seconds of a
+        // session are not a blur; congestion control still backs off if needed.
+        connection.setBweMinBitrateBps(
+            NSNumber(value: 1_000_000),
+            currentBitrateBps: NSNumber(value: min(8_000_000, video.maxBitrateBps)),
+            maxBitrateBps: NSNumber(value: video.maxBitrateBps))
     }
 
     /// Host: add the screen track and input channels, then send the offer.
@@ -322,11 +328,30 @@ extension PeerSession: RTCDataChannelDelegate {
 enum RTCEngine {
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
-        let encoder = RTCDefaultVideoEncoderFactory()
-        // H.264 is the codec with hardware encode and decode on every Mac.
-        if let h264 = encoder.supportedCodecs().first(where: { $0.name == kRTCVideoCodecH264Name }) {
-            encoder.preferredCodec = h264
-        }
-        return RTCPeerConnectionFactory(encoderFactory: encoder, decoderFactory: RTCDefaultVideoDecoderFactory())
+        return RTCPeerConnectionFactory(encoderFactory: ScreenCodecFactory(), decoderFactory: ScreenCodecFactory())
     }()
+}
+
+/// Offers exactly one codec: hardware H.264, High profile, level 5.2.
+///
+/// WebRTC's stock factory advertises H.264 at level 3.1, which tops out at
+/// 720p. Given a Retina-sized screen it silently falls back to software VP8
+/// and manages about one frame a second. Level 5.2 covers 4K at 60 fps, and
+/// leaving the software codecs out means it can never fall back unnoticed.
+final class ScreenCodecFactory: NSObject, RTCVideoEncoderFactory, RTCVideoDecoderFactory {
+    static let codec = RTCVideoCodecInfo(name: kRTCVideoCodecH264Name, parameters: [
+        "profile-level-id": "640c34", // constrained High, level 5.2
+        "level-asymmetry-allowed": "1",
+        "packetization-mode": "1",
+    ])
+
+    func supportedCodecs() -> [RTCVideoCodecInfo] { [Self.codec] }
+
+    func createEncoder(_ info: RTCVideoCodecInfo) -> RTCVideoEncoder? {
+        info.name == kRTCVideoCodecH264Name ? RTCVideoEncoderH264(codecInfo: info) : nil
+    }
+
+    func createDecoder(_ info: RTCVideoCodecInfo) -> RTCVideoDecoder? {
+        info.name == kRTCVideoCodecH264Name ? RTCVideoDecoderH264() : nil
+    }
 }
