@@ -94,6 +94,9 @@ public final class BridgeModel: ObservableObject {
             .flatMap { try? JSONDecoder().decode([PairedDevice].self, from: $0) } ?? []
         sessionLog = defaults.data(forKey: Keys.sessionLog)
             .flatMap { try? JSONDecoder().decode([SessionLogEntry].self, from: $0) } ?? []
+        // Public, and handy for provisioning: scripts/link-remote.sh pairs two
+        // Macs you already control by exchanging these over SSH.
+        defaults.set(identity.publicKey.base64EncodedString(), forKey: Keys.publicKey)
         capturer.onStop = { [weak self] _ in
             Task { @MainActor in self?.endHosting(notify: true) }
         }
@@ -567,6 +570,7 @@ public final class BridgeModel: ObservableObject {
         static let forcesRelay = "forcesRelay"
         static let paired = "pairedDevices"
         static let sessionLog = "sessionLog"
+        static let publicKey = "publicKey"
     }
 
     /// The rule the server enforces for anything used as a device ID.

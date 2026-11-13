@@ -25,16 +25,26 @@ targets:
       - App
     dependencies:
       - package: BridgeCore
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: MacBridge
+        LSApplicationCategoryType: public.app-category.utilities
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # The signaling server may be a plain ws:// address on a private
+        # network (Tailscale, LAN); the local-networking exception does not
+        # cover Tailscale's 100.x addresses. Sessions do not depend on TLS:
+        # setup messages are signed end to end. Over the open internet still
+        # use wss://, or the access token is sent in the clear.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.habibtalib.macbridge
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
         ARCHS: arm64
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: MacBridge
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
-        INFOPLIST_KEY_NSHumanReadableCopyright: ""
 schemes:
   MacBridge:
     build:
