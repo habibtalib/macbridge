@@ -52,6 +52,8 @@ public final class PeerSession: NSObject, @unchecked Sendable {
     public var onRemoteVideoTrack: ((RTCVideoTrack) -> Void)?
     /// Controller only: both input channels are open and `send` will go through.
     public var onInputReady: (() -> Void)?
+    /// Controller: text was copied on the host.
+    public var onClipboard: ((String) -> Void)?
 
     private static let reliableLabel = "input-reliable"
     private static let fastLabel = "input-fast"
@@ -185,7 +187,8 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         videoSource.capturer(capturer, didCapture: frame)
     }
 
-    /// Controller: send input to the host. Returns false if the channel is not open.
+    /// Controller: send input to the host. Host: send its clipboard (`.clipboard`) to the controller.
+    /// Returns false if the channel is not open.
     @discardableResult
     public func send(_ message: InputMessage) -> Bool {
         queue.sync {
@@ -313,9 +316,14 @@ extension PeerSession: RTCDataChannelDelegate {
     }
 
     public func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
-        // Only the host acts on input, and only well-formed messages.
-        guard role == .host, let message = try? InputMessage(decoding: buffer.data) else { return }
-        onInput?(message)
+        // Only well-formed messages. The host acts on input; the controller
+        // accepts nothing from the host but copied text.
+        guard let message = try? InputMessage(decoding: buffer.data) else { return }
+        switch role {
+        case .host: onInput?(message)
+        case .controller:
+            if case let .clipboard(text) = message { onClipboard?(text) }
+        }
     }
 
     private func reportInputReadyIfOpen() {

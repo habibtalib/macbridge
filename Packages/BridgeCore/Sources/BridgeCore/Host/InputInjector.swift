@@ -115,6 +115,9 @@ public final class InputInjector: @unchecked Sendable {
 
     private func postKey(_ keyCode: UInt16, isDown: Bool, flags: CGEventFlags) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: isDown) else { return }
+        var flags = flags
+        // Real arrow keys carry these two marks; macOS expects them on Control-arrow (switch desktop).
+        if (123...126).contains(keyCode) { flags.formUnion([.maskNumericPad, .maskSecondaryFn]) }
         event.flags = flags
         event.post(tap: .cghidEventTap)
     }

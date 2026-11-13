@@ -65,6 +65,8 @@ public final class BridgeModel: ObservableObject {
 
     private var controllerSession: PeerSession?
     private var controllerPeer: PairedDevice?
+    private var controllerClipboard: ClipboardSync?
+    private var hostClipboard: ClipboardSync?
 
     private var hostSession: PeerSession?
     private var hostPeer: PairedDevice?
@@ -361,14 +363,31 @@ public final class BridgeModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 switch state {
-                case .connected: self.controllerStatus = .connected(host)
+                case .connected:
+                    self.controllerStatus = .connected(host)
+                    guard self.controllerClipboard == nil else { break }
+                    let clipboard = ClipboardSync()
+                    clipboard.onLocalCopy = { [weak session] text in session?.send(.clipboard(text: text)) }
+                    clipboard.start()
+                    self.controllerClipboard = clipboard
                 case .failed: self.endControlling(.failed("Connection to \(host.name) failed"))
                 case .closed: self.endControlling(.idle)
                 case .connecting, .disconnected: break
                 }
             }
         }
+        session.onClipboard = { [weak self] text in
+            Task { @MainActor in
+                guard let self, self.controllerSession === session else { return }
+                self.controllerClipboard?.receive(text)
+            }
+        }
         send(.request, to: host)
+    }
+
+    /// Presses a shortcut on the host that this Mac's keyboard cannot send, because macOS acts on it here first.
+    public func sendShortcut(_ shortcut: RemoteShortcut) {
+        for message in shortcut.messages { controllerSession?.send(message) }
     }
 
     public func disconnect() {
@@ -391,6 +410,8 @@ public final class BridgeModel: ObservableObject {
         let session = controllerSession
         controllerSession = nil
         controllerPeer = nil
+        controllerClipboard?.stop()
+        controllerClipboard = nil
         remoteVideo = nil
         remoteVideoSize = nil
         controllerStatus = status
@@ -442,8 +463,18 @@ public final class BridgeModel: ObservableObject {
             guard hostSession === session else { return } // replaced while starting
             let injector = InputInjector(display: display)
             self.injector = injector
+            let clipboard = ClipboardSync()
+            clipboard.onLocalCopy = { [weak session] text in session?.send(.clipboard(text: text)) }
+            clipboard.start()
+            hostClipboard = clipboard
             session.onInput = { [weak self] message in
                 switch message {
+                case let .clipboard(text):
+                    // Through the sync, so the copy is not sent straight back.
+                    Task { @MainActor in
+                        guard let self, self.hostSession === session else { return }
+                        self.hostClipboard?.receive(text)
+                    }
                 case .nextDisplay, .quality:
                     Task { @MainActor in
                         guard let self, self.hostSession === session else { return }
@@ -515,6 +546,8 @@ public final class BridgeModel: ObservableObject {
         hostDisplay = nil
         logSessionEnd()
         capturer.onFrame = nil
+        hostClipboard?.stop()
+        hostClipboard = nil
         injector?.releaseAll()
         injector = nil
         session?.close()

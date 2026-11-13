@@ -52,6 +52,14 @@ import WebRTC
         #expect(controller.send(.mouseMove(x: 0.25, y: 0.75)))
         try await poll("pointer move on the host") { received.value.contains(.mouseMove(x: 0.25, y: 0.75)) }
 
+        // Clipboard: text copied on the host reaches the controller, and nothing else the host sends does.
+        let copied = Box<[String]>([])
+        controller.onClipboard = { text in copied.update { $0.append(text) } }
+        #expect(host.send(.key(keyCode: 0x00, isDown: true, modifiers: 0)))
+        #expect(host.send(.clipboard(text: "from the host")))
+        try await poll("host clipboard on the controller") { !copied.value.isEmpty }
+        #expect(copied.value == ["from the host"])
+
         // The stream is hardware H.264 at the size that was pushed.
         let stats = Box<[[String: String]]>([])
         host.videoStats { report in stats.update { $0 = report } }

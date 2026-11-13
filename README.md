@@ -41,9 +41,10 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
 ## In a session
 
 - Mouse, keyboard and scroll go to the other Mac while its screen has focus, including ⌘ shortcuts.
-- ⌘V pastes text from this Mac's clipboard on the other Mac. Copying from the other Mac back to this one is not implemented yet.
-- Toolbar: quality (Sharp / Balanced / Light), next display, disconnect.
-- ⌘Tab, ⌘Space and other shortcuts macOS handles before apps see them stay on this Mac.
+- The clipboards stay the same: text copied on either Mac can be pasted on the other. Text only, up to 100 KB; copies a password manager marks as private are not sent.
+- Toolbar: previous desktop, Mission Control, next desktop, quality (Sharp / Balanced / Light), next display, disconnect.
+- Control-← and Control-→ (switch desktop), Control-↑ and ⌘Space go to the other Mac while the session window is in front, if this Mac allows MacBridge under Accessibility. Without that, use the toolbar buttons.
+- Trackpad swipes between desktops and ⌘Tab stay on this Mac.
 
 ## Limits
 

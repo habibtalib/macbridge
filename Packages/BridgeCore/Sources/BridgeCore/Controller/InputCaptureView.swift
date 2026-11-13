@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
 
 /// Transparent layer over the remote screen. While the pointer is over it and
@@ -30,8 +31,36 @@ public struct InputCaptureView: NSViewRepresentable {
 
         public override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            window?.acceptsMouseMovedEvents = true
-            window?.makeFirstResponder(self)
+            NotificationCenter.default.removeObserver(self)
+            releaseSystemShortcuts()
+            guard let window else { return }
+            window.acceptsMouseMovedEvents = true
+            window.makeFirstResponder(self)
+            NotificationCenter.default.addObserver(self, selector: #selector(windowBecameKey), name: NSWindow.didBecomeKeyNotification, object: window)
+            NotificationCenter.default.addObserver(self, selector: #selector(windowResignedKey), name: NSWindow.didResignKeyNotification, object: window)
+            if window.isKeyWindow { takeSystemShortcuts() }
+        }
+
+        // MARK: System shortcuts
+
+        /// While the session window is in front, macOS stops acting on its own
+        /// shortcuts (Control-arrows, Mission Control, Spotlight), so they reach
+        /// this view and go to the host. macOS only honours this for apps
+        /// allowed under Accessibility; without it the toolbar buttons remain.
+        private var shortcutToken: UnsafeMutableRawPointer?
+
+        @objc private func windowBecameKey() { takeSystemShortcuts() }
+        @objc private func windowResignedKey() { releaseSystemShortcuts() }
+
+        private func takeSystemShortcuts() {
+            guard shortcutToken == nil else { return }
+            shortcutToken = PushSymbolicHotKeyMode(OptionBits(kHIHotKeyModeAllDisabled))
+        }
+
+        private func releaseSystemShortcuts() {
+            guard let token = shortcutToken else { return }
+            PopSymbolicHotKeyMode(token)
+            shortcutToken = nil
         }
 
         public override func updateTrackingAreas() {
@@ -111,6 +140,31 @@ public struct InputCaptureView: NSViewRepresentable {
             }
             send(.key(keyCode: event.keyCode, isDown: isDown, modifiers: InputMapping.wireModifiers(event.modifierFlags)))
         }
+    }
+}
+
+/// Shortcuts macOS acts on before an app sees them, sent to the host from the toolbar.
+public enum RemoteShortcut: CaseIterable, Sendable {
+    case previousDesktop, nextDesktop, missionControl
+
+    var keyCode: UInt16 {
+        switch self {
+        case .previousDesktop: return 123 // ←
+        case .nextDesktop: return 124     // →
+        case .missionControl: return 126  // ↑
+        }
+    }
+
+    /// Control down, the arrow down and up, Control up: what the keyboard would send.
+    public var messages: [InputMessage] {
+        let control = InputMapping.wireModifiers([.control])
+        let arrow = InputMapping.wireModifiers([.control, .function])
+        return [
+            .key(keyCode: 59, isDown: true, modifiers: control),
+            .key(keyCode: keyCode, isDown: true, modifiers: arrow),
+            .key(keyCode: keyCode, isDown: false, modifiers: arrow),
+            .key(keyCode: 59, isDown: false, modifiers: 0),
+        ]
     }
 }
 
