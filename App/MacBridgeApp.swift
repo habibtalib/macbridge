@@ -3,27 +3,30 @@ import SwiftUI
 
 @main
 struct MacBridgeApp: App {
+    @StateObject private var model = BridgeModel()
+
     var body: some Scene {
-        WindowGroup("MacBridge") {
-            ContentView()
+        Window("MacBridge", id: "main") {
+            RootView()
+                .environmentObject(model)
+                .onAppear { if model.canGoOnline { model.goOnline() } }
         }
-        .windowResizability(.contentSize)
+        .commands {
+            // The remote screen takes ⌘ shortcuts while it has focus, so the
+            // local "New Window" item would only get in the way.
+            CommandGroup(replacing: .newItem) {}
+        }
     }
 }
 
-struct ContentView: View {
+struct RootView: View {
+    @EnvironmentObject private var model: BridgeModel
+
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "rectangle.on.rectangle")
-                .font(.system(size: 40))
-                .foregroundStyle(.tint)
-            Text("MacBridge")
-                .font(.title2.weight(.semibold))
-            Text("Protocol v\(InputMessage.protocolVersion)")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        if let video = model.remoteVideo {
+            SessionView(video: video)
+        } else {
+            HomeView()
         }
-        .padding(40)
-        .frame(minWidth: 320)
     }
 }
