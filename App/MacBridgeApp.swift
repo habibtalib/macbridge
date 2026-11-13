@@ -1,17 +1,15 @@
 import BridgeCore
+import ServiceManagement
 import SwiftUI
 
 @main
 struct MacBridgeApp: App {
-    /// Nil if the identity key could not be loaded from the keychain.
     @StateObject private var launch = Launch()
 
     var body: some Scene {
         Window("MacBridge", id: "main") {
             if let model = launch.model {
-                RootView()
-                    .environmentObject(model)
-                    .onAppear { if model.canGoOnline { model.goOnline() } }
+                RootView().environmentObject(model)
             } else {
                 KeychainErrorView()
             }
@@ -21,15 +19,31 @@ struct MacBridgeApp: App {
             // local "New Window" item would only get in the way.
             CommandGroup(replacing: .newItem) {}
         }
+
+        // Keeps the app running, and visibly so, with the window closed:
+        // a Mac that can be controlled should always show that it can.
+        MenuBarExtra {
+            if let model = launch.model {
+                MenuBarContent().environmentObject(model)
+            } else {
+                Button("Quit MacBridge") { NSApplication.shared.terminate(nil) }
+            }
+        } label: {
+            MenuBarIcon(model: launch.model)
+        }
     }
 }
 
 @MainActor
 final class Launch: ObservableObject {
+    /// Nil if the identity key could not be loaded from the keychain.
     let model: BridgeModel?
 
     init() {
         model = (try? Identity.loadOrCreate()).map { BridgeModel(identity: $0) }
+        // Online from launch, window or not: after a login-item start nobody
+        // is there to click anything.
+        if let model, model.canGoOnline { model.goOnline() }
     }
 }
 
@@ -41,6 +55,80 @@ struct RootView: View {
             SessionView(video: video)
         } else {
             HomeView()
+        }
+    }
+}
+
+private struct MenuBarIcon: View {
+    let model: BridgeModel?
+
+    var body: some View {
+        if let model {
+            Icon(model: model)
+        } else {
+            Image(systemName: "rectangle.on.rectangle.slash")
+        }
+    }
+
+    private struct Icon: View {
+        @ObservedObject var model: BridgeModel
+
+        var body: some View {
+            if case .sharing = model.hostStatus {
+                // Unmissable while someone is in control.
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.red)
+            } else {
+                Image(systemName: "rectangle.on.rectangle")
+            }
+        }
+    }
+}
+
+private struct MenuBarContent: View {
+    @EnvironmentObject private var model: BridgeModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        switch model.hostStatus {
+        case let .sharing(peer):
+            Text("\(peer.name) is controlling this Mac")
+            Button("End Session") { model.endHostSession() }
+        case .idle:
+            Text(statusLine)
+        }
+        Divider()
+        Button("Open MacBridge") {
+            openWindow(id: "main")
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+        Toggle("Allow This Mac to Be Controlled", isOn: $model.allowsControl)
+        Divider()
+        Button("Quit MacBridge") { NSApplication.shared.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+
+    private var statusLine: String {
+        switch model.signalingStatus {
+        case .offline: return "Offline"
+        case .connecting: return "Connecting…"
+        case .online: return model.allowsControl ? "Online, can be controlled" : "Online"
+        }
+    }
+}
+
+/// Start MacBridge when the user logs in.
+enum LoginItem {
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    /// Returns an explanation if the change did not go through.
+    static func setEnabled(_ enabled: Bool) -> String? {
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 }

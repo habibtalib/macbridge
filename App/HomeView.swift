@@ -5,6 +5,8 @@ struct HomeView: View {
     @EnvironmentObject private var model: BridgeModel
     @State private var typedCode = ""
     @State private var isEnteringCode = false
+    @State private var startsAtLogin = LoginItem.isEnabled
+    @State private var loginItemError: String?
 
     private var isOnline: Bool { model.signalingStatus == .online }
 
@@ -112,9 +114,24 @@ struct HomeView: View {
                     request: model.requestInputPermission,
                     settingsPane: "Privacy_Accessibility"
                 )
+                Toggle("Open MacBridge at login", isOn: $startsAtLogin)
+                    .onChange(of: startsAtLogin) { _, enabled in
+                        loginItemError = LoginItem.setEnabled(enabled)
+                        startsAtLogin = LoginItem.isEnabled
+                    }
+                if let loginItemError {
+                    Text(loginItemError).font(.callout).foregroundStyle(.red)
+                }
+                Text("This Mac stays awake while it can be controlled. After a restart it is reachable once someone has logged in.")
+                    .font(.callout).foregroundStyle(.secondary)
+
                 if case let .sharing(peer) = model.hostStatus {
-                    Label("\(peer.name) is controlling this Mac", systemImage: "dot.radiowaves.left.and.right")
-                        .foregroundStyle(.red)
+                    HStack {
+                        Label("\(peer.name) is controlling this Mac", systemImage: "dot.radiowaves.left.and.right")
+                            .foregroundStyle(.red)
+                        Spacer()
+                        Button("End session") { model.endHostSession() }
+                    }
                 }
 
                 ForEach(model.controllers) { device in
@@ -125,6 +142,16 @@ struct HomeView: View {
                         }
                         Spacer()
                         Button("Remove", role: .destructive) { model.revokeControl(from: device) }
+                    }
+                }
+
+                if !model.sessionLog.isEmpty {
+                    DisclosureGroup("Recent sessions") {
+                        ForEach(model.sessionLog.prefix(10)) { entry in
+                            LabeledContent(entry.deviceName) {
+                                Text(Self.describe(entry)).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
 
@@ -166,6 +193,13 @@ struct HomeView: View {
                 }
             }
         }
+    }
+
+    private static func describe(_ entry: SessionLogEntry) -> String {
+        let start = entry.started.formatted(date: .abbreviated, time: .shortened)
+        guard let ended = entry.ended else { return "\(start), in progress" }
+        let duration = Duration.seconds(ended.timeIntervalSince(entry.started).rounded())
+        return "\(start), \(duration.formatted(.units(allowed: [.hours, .minutes, .seconds], width: .narrow)))"
     }
 
     @ViewBuilder private var signalingStatus: some View {

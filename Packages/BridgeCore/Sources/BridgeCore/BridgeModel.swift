@@ -36,11 +36,16 @@ public final class BridgeModel: ObservableObject {
         didSet {
             defaults.set(allowsControl, forKey: Keys.allowsControl)
             if !allowsControl { endHosting(notify: true) }
+            updatePower()
         }
     }
 
     @Published public private(set) var paired: [PairedDevice] = []
-    @Published public private(set) var signalingStatus: SignalingClient.Status = .offline
+    @Published public private(set) var signalingStatus: SignalingClient.Status = .offline {
+        didSet { updatePower() }
+    }
+    /// Who controlled this Mac and when, newest first.
+    @Published public private(set) var sessionLog: [SessionLogEntry] = []
     @Published public private(set) var controllerStatus: ControllerStatus = .idle
     @Published public private(set) var hostStatus: HostStatus = .idle
     @Published public private(set) var pairingStatus: PairingStatus = .idle
@@ -64,6 +69,8 @@ public final class BridgeModel: ObservableObject {
     private var hostPeer: PairedDevice?
     private var injector: InputInjector?
     private let capturer = ScreenCapturer()
+    private let power = PowerAssertions()
+    private var currentLogEntry: UUID?
     /// Newest request accepted from each device, to refuse replays.
     private var lastRequest: [String: Int64] = [:]
 
@@ -82,9 +89,17 @@ public final class BridgeModel: ObservableObject {
         allowsControl = defaults.bool(forKey: Keys.allowsControl)
         paired = defaults.data(forKey: Keys.paired)
             .flatMap { try? JSONDecoder().decode([PairedDevice].self, from: $0) } ?? []
+        sessionLog = defaults.data(forKey: Keys.sessionLog)
+            .flatMap { try? JSONDecoder().decode([SessionLogEntry].self, from: $0) } ?? []
         capturer.onStop = { [weak self] _ in
             Task { @MainActor in self?.endHosting(notify: true) }
         }
+    }
+
+    /// While this Mac accepts control and is meant to be online, it must not
+    /// fall asleep, or it would drop off the server.
+    private func updatePower() {
+        power.keepSystemAwake = allowsControl && signaling != nil
     }
 
     public var parsedServerURL: URL? { Self.parseServerURL(serverURL) }
@@ -109,6 +124,7 @@ public final class BridgeModel: ObservableObject {
         client.onPairReply = { [weak self] from, sealed in self?.receivePairReply(sealed, from: from) }
         signaling = client
         client.connect()
+        updatePower()
     }
 
     public func goOffline() {
@@ -118,6 +134,7 @@ public final class BridgeModel: ObservableObject {
         signaling?.disconnect()
         signaling = nil
         signalingStatus = .offline
+        updatePower()
     }
 
     private func send(_ payload: SignalPayload, to peer: PairedDevice) {
@@ -401,7 +418,10 @@ public final class BridgeModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.hostSession === session else { return }
                 switch state {
-                case .connected: self.hostStatus = .sharing(to: peer)
+                case .connected:
+                    guard self.hostStatus == .idle else { break }
+                    self.hostStatus = .sharing(to: peer)
+                    self.logSessionStart(peer)
                 case .failed, .closed: self.endHosting(notify: false)
                 case .connecting, .disconnected: break
                 }
@@ -409,6 +429,8 @@ public final class BridgeModel: ObservableObject {
         }
 
         do {
+            // A sleeping display gives the capturer nothing to send.
+            power.keepDisplayAwake = true
             let display = try await capturer.start()
             guard hostSession === session else { return } // replaced while starting
             let injector = InputInjector(display: display)
@@ -428,6 +450,11 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
+    /// Ends the session in which this Mac is being controlled.
+    public func endHostSession() {
+        endHosting(notify: true)
+    }
+
     private func endHosting(notify: Bool) {
         guard let peer = hostPeer else { return }
         if notify { send(.bye, to: peer) }
@@ -435,11 +462,34 @@ public final class BridgeModel: ObservableObject {
         hostSession = nil
         hostPeer = nil
         hostStatus = .idle
+        power.keepDisplayAwake = false
+        logSessionEnd()
         capturer.onFrame = nil
         injector?.releaseAll()
         injector = nil
         session?.close()
         Task { await capturer.stop() }
+    }
+
+    // MARK: - Session log
+
+    private func logSessionStart(_ peer: PairedDevice) {
+        let entry = SessionLogEntry(deviceID: peer.id, deviceName: peer.name, started: Date())
+        currentLogEntry = entry.id
+        sessionLog.insert(entry, at: 0)
+        sessionLog = Array(sessionLog.prefix(100))
+        saveSessionLog()
+    }
+
+    private func logSessionEnd() {
+        guard let id = currentLogEntry, let index = sessionLog.firstIndex(where: { $0.id == id }) else { return }
+        currentLogEntry = nil
+        sessionLog[index].ended = Date()
+        saveSessionLog()
+    }
+
+    private func saveSessionLog() {
+        defaults.set(try? JSONEncoder().encode(sessionLog), forKey: Keys.sessionLog)
     }
 
     // MARK: - Permissions
@@ -469,6 +519,7 @@ public final class BridgeModel: ObservableObject {
         static let allowsControl = "allowsControl"
         static let forcesRelay = "forcesRelay"
         static let paired = "pairedDevices"
+        static let sessionLog = "sessionLog"
     }
 
     /// The rule the server enforces for anything used as a device ID.
