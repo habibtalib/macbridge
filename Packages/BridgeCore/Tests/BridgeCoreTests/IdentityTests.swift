@@ -125,7 +125,7 @@ import Testing
         PairedDevice(id: controller.deviceID, publicKey: controller.publicKey, name: "Laptop", mayControlThisMac: true)
     }
     var hostAsSeenByController: PairedDevice {
-        PairedDevice(id: host.deviceID, publicKey: host.publicKey, name: "Studio", mayControlThisMac: false)
+        PairedDevice(id: host.deviceID, publicKey: host.publicKey, name: "Studio", thisMacMayControl: true)
     }
 
     static let sdp = "v=0\r\na=group:BUNDLE 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\na=setup:actpass\r\n"

@@ -1,7 +1,32 @@
 import Foundation
 
-/// WebSocket connection to the signaling server. Stays connected: if the socket
-/// drops it reconnects with backoff until `disconnect()` is called.
+/// A setup message plus, where required, the sender's proof of identity.
+public struct SignalEnvelope: Equatable, Sendable, Codable {
+    public var payload: SignalPayload
+    public var auth: SignalAuth?
+
+    public init(_ payload: SignalPayload, auth: SignalAuth? = nil) {
+        self.payload = payload
+        self.auth = auth
+    }
+
+    private enum CodingKeys: String, CodingKey { case auth }
+
+    public init(from decoder: Decoder) throws {
+        payload = try SignalPayload(from: decoder)
+        auth = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(SignalAuth.self, forKey: .auth)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try payload.encode(to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(auth, forKey: .auth)
+    }
+}
+
+/// WebSocket connection to the signaling server. Logs in by proving it holds
+/// the identity key, then stays connected: if the socket drops it reconnects
+/// with backoff until `disconnect()` is called.
 ///
 /// Callbacks are delivered on the main queue.
 public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
@@ -12,17 +37,27 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     }
 
     public enum ServerError: Equatable, Sendable {
-        /// The device a signal was addressed to is not connected.
+        /// The device a message was addressed to is not connected.
         case peerOffline(String)
+        /// Nobody is waiting for that pairing code.
+        case noSuchPairing
+        /// The server refused the login (wrong access token or key). The
+        /// client stops reconnecting; retrying cannot succeed.
+        case unauthorized(String)
         case other(String)
     }
 
     public var onStatus: ((Status) -> Void)?
-    public var onSignal: ((_ from: String, SignalPayload) -> Void)?
+    public var onSignal: ((_ from: String, SignalEnvelope) -> Void)?
     public var onError: ((ServerError) -> Void)?
+    /// A device that typed our pairing code introduces itself.
+    public var onPairRequest: ((_ from: String, _ sealed: Data) -> Void)?
+    /// The device whose code we typed answers.
+    public var onPairReply: ((_ from: String, _ sealed: Data) -> Void)?
 
     private let url: URL
-    private let deviceID: String
+    private let identity: Identity
+    private let accessToken: String?
     private let queue = DispatchQueue(label: "macbridge.signaling")
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
 
@@ -31,10 +66,12 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     private var wantsConnection = false
     private var attempt = 0
     private var status: Status = .offline
+    private var iceWaiters: [([IceServer]) -> Void] = []
 
-    public init(url: URL, deviceID: String) {
+    public init(url: URL, identity: Identity, accessToken: String? = nil) {
         self.url = url
-        self.deviceID = deviceID
+        self.identity = identity
+        self.accessToken = accessToken?.isEmpty == false ? accessToken : nil
     }
 
     public func connect() {
@@ -47,20 +84,37 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     }
 
     public func disconnect() {
+        queue.async { self.stop() }
+    }
+
+    public func send(_ envelope: SignalEnvelope, to peer: String) {
+        write(.signal(to: peer, data: envelope))
+    }
+
+    /// Asks the server for STUN/TURN servers with fresh credentials.
+    /// Completes on the main queue with an empty list if the server does not
+    /// answer in time; a direct connection may still work without them.
+    public func requestIceServers(timeout: TimeInterval = 3, completion: @escaping ([IceServer]) -> Void) {
         queue.async {
-            self.wantsConnection = false
-            self.task?.cancel(with: .goingAway, reason: nil)
-            self.task = nil
-            self.set(.offline)
+            guard let task = self.task, self.status == .online else {
+                return DispatchQueue.main.async { completion([]) }
+            }
+            var finished = false
+            let finish: ([IceServer]) -> Void = { servers in
+                guard !finished else { return }
+                finished = true
+                DispatchQueue.main.async { completion(servers) }
+            }
+            self.iceWaiters.append(finish)
+            self.write(.ice, on: task)
+            self.queue.asyncAfter(deadline: .now() + timeout) { finish([]) }
         }
     }
 
-    public func send(_ payload: SignalPayload, to peer: String) {
-        queue.async {
-            guard let task = self.task, self.status == .online else { return }
-            self.write(Outgoing.signal(to: peer, data: payload), on: task)
-        }
-    }
+    public func openPairing(tag: String) { write(.pairOpen(tag: tag)) }
+    public func closePairing() { write(.pairClose) }
+    public func sendPairRequest(tag: String, sealed: Data) { write(.pair(tag: tag, sealed: sealed)) }
+    public func sendPairReply(to peer: String, sealed: Data) { write(.pairReply(to: peer, sealed: sealed)) }
 
     // MARK: - Connection
 
@@ -70,8 +124,16 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         task.maximumMessageSize = 256 * 1024
         self.task = task
         task.resume()
-        write(Outgoing.hello(id: deviceID), on: task)
+        write(.hello(id: identity.deviceID, key: identity.publicKey, token: accessToken), on: task)
         receive(on: task)
+    }
+
+    private func stop() {
+        wantsConnection = false
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        flushIceWaiters()
+        set(.offline)
     }
 
     private func receive(on task: URLSessionWebSocketTask) {
@@ -81,7 +143,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
                 guard task === self.task else { return }
                 switch result {
                 case let .success(message):
-                    self.handle(message)
+                    self.handle(message, on: task)
                     self.receive(on: task)
                 case .failure:
                     self.dropped(task)
@@ -94,6 +156,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         guard task === self.task else { return }
         self.task = nil
         task.cancel(with: .goingAway, reason: nil)
+        flushIceWaiters()
         guard wantsConnection else { return set(.offline) }
         set(.connecting)
         attempt += 1
@@ -104,7 +167,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         }
     }
 
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
+    private func handle(_ message: URLSessionWebSocketTask.Message, on task: URLSessionWebSocketTask) {
         let data: Data
         switch message {
         case let .string(text): data = Data(text.utf8)
@@ -113,13 +176,37 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         }
         guard let incoming = try? JSONDecoder().decode(Incoming.self, from: data) else { return }
         switch incoming {
+        case let .challenge(nonce):
+            let message = Data("macbridge-auth-v1|\(identity.deviceID)|\(nonce)".utf8)
+            write(.auth(signature: identity.sign(message)), on: task)
         case .welcome:
             attempt = 0
             set(.online)
-        case let .signal(from, payload):
-            DispatchQueue.main.async { self.onSignal?(from, payload) }
+        case let .signal(from, envelope):
+            DispatchQueue.main.async { self.onSignal?(from, envelope) }
+        case let .ice(servers):
+            flushIceWaiters(with: servers)
+        case let .pair(from, sealed):
+            DispatchQueue.main.async { self.onPairRequest?(from, sealed) }
+        case let .pairReply(from, sealed):
+            DispatchQueue.main.async { self.onPairReply?(from, sealed) }
         case let .error(error):
+            if case .unauthorized = error { stop() }
             DispatchQueue.main.async { self.onError?(error) }
+        }
+    }
+
+    private func flushIceWaiters(with servers: [IceServer] = []) {
+        let waiters = iceWaiters
+        iceWaiters.removeAll()
+        waiters.forEach { $0(servers) }
+    }
+
+    /// Sends once logged in; dropped otherwise.
+    private func write(_ message: Outgoing) {
+        queue.async {
+            guard let task = self.task, self.status == .online else { return }
+            self.write(message, on: task)
         }
     }
 
@@ -153,48 +240,101 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
 
 // MARK: - Wire messages
 
-private enum Outgoing: Encodable {
-    case hello(id: String)
-    case signal(to: String, data: SignalPayload)
+private struct Sealed: Codable {
+    var sealed: Data
+}
 
-    private enum CodingKeys: String, CodingKey { case type, id, to, data }
+private enum Outgoing: Encodable {
+    case hello(id: String, key: Data, token: String?)
+    case auth(signature: Data)
+    case signal(to: String, data: SignalEnvelope)
+    case ice
+    case pairOpen(tag: String)
+    case pairClose
+    case pair(tag: String, sealed: Data)
+    case pairReply(to: String, sealed: Data)
+
+    private enum CodingKeys: String, CodingKey { case type, id, key, token, sig, to, data, tag }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .hello(id):
+        case let .hello(id, key, token):
             try c.encode("hello", forKey: .type)
             try c.encode(id, forKey: .id)
+            try c.encode(key, forKey: .key)
+            try c.encodeIfPresent(token, forKey: .token)
+        case let .auth(signature):
+            try c.encode("auth", forKey: .type)
+            try c.encode(signature, forKey: .sig)
         case let .signal(to, data):
             try c.encode("signal", forKey: .type)
             try c.encode(to, forKey: .to)
             try c.encode(data, forKey: .data)
+        case .ice:
+            try c.encode("ice", forKey: .type)
+        case let .pairOpen(tag):
+            try c.encode("pair-open", forKey: .type)
+            try c.encode(tag, forKey: .tag)
+        case .pairClose:
+            try c.encode("pair-close", forKey: .type)
+        case let .pair(tag, sealed):
+            try c.encode("pair", forKey: .type)
+            try c.encode(tag, forKey: .tag)
+            try c.encode(Sealed(sealed: sealed), forKey: .data)
+        case let .pairReply(to, sealed):
+            try c.encode("pair-reply", forKey: .type)
+            try c.encode(to, forKey: .to)
+            try c.encode(Sealed(sealed: sealed), forKey: .data)
         }
     }
 }
 
 private enum Incoming: Decodable {
+    case challenge(nonce: String)
     case welcome
-    case signal(from: String, SignalPayload)
+    case signal(from: String, SignalEnvelope)
+    case ice([IceServer])
+    case pair(from: String, sealed: Data)
+    case pairReply(from: String, sealed: Data)
     case error(SignalingClient.ServerError)
 
-    private enum CodingKeys: String, CodingKey { case type, from, data, code, to }
+    private enum CodingKeys: String, CodingKey { case type, nonce, from, data, servers, code, to }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(String.self, forKey: .type) {
+        case "challenge":
+            self = .challenge(nonce: try c.decode(String.self, forKey: .nonce))
         case "welcome":
             self = .welcome
         case "signal":
             self = .signal(
                 from: try c.decode(String.self, forKey: .from),
-                try c.decode(SignalPayload.self, forKey: .data)
+                try c.decode(SignalEnvelope.self, forKey: .data)
+            )
+        case "ice":
+            self = .ice(try c.decode([IceServer].self, forKey: .servers))
+        case "pair":
+            self = .pair(
+                from: try c.decode(String.self, forKey: .from),
+                sealed: try c.decode(Sealed.self, forKey: .data).sealed
+            )
+        case "pair-reply":
+            self = .pairReply(
+                from: try c.decode(String.self, forKey: .from),
+                sealed: try c.decode(Sealed.self, forKey: .data).sealed
             )
         case "error":
             let code = try c.decode(String.self, forKey: .code)
-            if code == "offline", let to = try c.decodeIfPresent(String.self, forKey: .to) {
-                self = .error(.peerOffline(to))
-            } else {
+            switch code {
+            case "offline":
+                self = .error(.peerOffline(try c.decodeIfPresent(String.self, forKey: .to) ?? ""))
+            case "no-such-pairing":
+                self = .error(.noSuchPairing)
+            case "bad-token", "bad-auth", "bad-id":
+                self = .error(.unauthorized(code))
+            default:
                 self = .error(.other(code))
             }
         case let other:

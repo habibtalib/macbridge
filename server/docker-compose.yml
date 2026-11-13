@@ -1,0 +1,45 @@
+# MacBridge server side: the signaling service and a TURN relay.
+#
+#   cp .env.example .env   # then fill it in
+#   docker compose up -d --build
+#
+# Put the signaling service behind your reverse proxy with TLS, forwarding
+# wss://<your-domain> to 127.0.0.1:8787 (WebSocket upgrade enabled).
+services:
+  signaling:
+    build: .
+    restart: unless-stopped
+    environment:
+      ACCESS_TOKEN: ${ACCESS_TOKEN:?set ACCESS_TOKEN in .env}
+      TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET in .env}
+      TURN_URLS: ${TURN_URLS:?set TURN_URLS in .env}
+      STUN_URLS: ${STUN_URLS:-}
+    ports:
+      # Local only: the reverse proxy is the public entrance.
+      - "127.0.0.1:8787:8787"
+
+  coturn:
+    image: coturn/coturn:4.18
+    restart: unless-stopped
+    # Relaying uses a range of UDP ports; host networking avoids mapping each one.
+    network_mode: host
+    command:
+      - -n # no config file; everything is given here
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --realm=${TURN_HOST:?set TURN_HOST in .env}
+      - --external-ip=${PUBLIC_IP:?set PUBLIC_IP in .env}
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --fingerprint
+      - --no-multicast-peers
+      # The relay must not be usable to reach this server's own or private networks.
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --log-file=stdout

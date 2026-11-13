@@ -1,20 +1,24 @@
 import CryptoKit
 import Foundation
 
-/// A device this Mac has paired with.
+/// A device this Mac has paired with. Pairing grants control in one
+/// direction only: the Mac that showed the code can be controlled by the Mac
+/// that typed it. Pairing again the other way round sets both flags.
 public struct PairedDevice: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var publicKey: Data
     public var name: String
-    /// True on the Mac that showed the pairing code: the other device was
-    /// given the right to control this one. Pairing does not grant the reverse.
+    /// That device may control this Mac (this Mac showed it a code).
     public var mayControlThisMac: Bool
+    /// This Mac may control that device (this Mac typed its code).
+    public var thisMacMayControl: Bool
 
-    public init(id: String, publicKey: Data, name: String, mayControlThisMac: Bool) {
+    public init(id: String, publicKey: Data, name: String, mayControlThisMac: Bool = false, thisMacMayControl: Bool = false) {
         self.id = id
         self.publicKey = publicKey
         self.name = name
         self.mayControlThisMac = mayControlThisMac
+        self.thisMacMayControl = thisMacMayControl
     }
 }
 

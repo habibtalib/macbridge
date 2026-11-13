@@ -27,7 +27,7 @@ struct SessionView: View {
 
     private var title: String {
         switch model.controllerStatus {
-        case let .connected(host), let .calling(host): return host
+        case let .connected(host), let .calling(host): return host.name
         default: return "MacBridge"
         }
     }
