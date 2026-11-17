@@ -8,7 +8,8 @@ Status: early; used between Macs on a private network (Tailscale), not yet tried
 
 | Path | What |
 |---|---|
-| `App/` | SwiftUI app (home screen, session window) |
+| `App/` | Mac app (home window, session window, settings) |
+| `Mobile/` | iPhone and iPad app (controller only) |
 | `Packages/BridgeCore/` | Everything else: input protocol, signaling client, WebRTC session, screen capture, input injection |
 | `server/` | Signaling server (Node 24, TypeScript, `ws`) |
 
@@ -66,6 +67,26 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
 - A small panel in the top right corner says who is in control and for how long, with **End**. The menu bar icon turns red.
 - **With the lid closed** (Settings → Security, laptops only): *Sleep as usual*, *Stay reachable on the power adapter*, or *Always stay reachable*. It applies while Allow control is on and the Mac is online. The other Mac sees a virtual display, since the built-in screen is off. Staying awake needs [LidAwake](https://github.com/habibtalib/lidawake) installed: macOS only lets an administrator switch off lid-close sleep, and LidAwake holds that permission. Its battery and heat limits still apply. MacBridge turns it off again when control is switched off, the Mac goes offline or the app quits, unless you had turned LidAwake on yourself.
 - **Ask first** (Settings → Security, per Mac): that Mac must be accepted on this Mac before it can connect. No answer in 30 seconds declines. Leave it off for a Mac nobody sits at.
+
+## iPhone and iPad
+
+`MacBridgeMobile` controls a Mac from an iPhone or iPad. It cannot be controlled itself: iOS does not allow it.
+
+```sh
+xcodegen generate
+open MacBridge.xcodeproj      # choose the MacBridgeMobile scheme and your device, then Run
+```
+
+- **Set up:** in Settings (gear) enter the same server as your Macs and go online. If the server is on a private network such as Tailscale, the device has to be on it too.
+- **Add a Mac:** on the Mac click **Show pairing code**, then scan its QR code with the scan button, or type the code and tap **Pair**.
+- **Pointer:** two modes, switched from the bar at the top.
+  - *Touch* (default on iPad): tap where you want to click, long press for a right click, drag to drag.
+  - *Trackpad* (default on iPhone): drag to move the pointer, tap to click, tap then touch and drag to drag.
+  - In both: two-finger tap is a right click, two-finger drag scrolls, pinch zooms the picture. While zoomed in, two fingers move the picture instead of scrolling.
+- **Keyboard:** the keyboard button opens the on-screen keyboard with a bar for ⌘ ⌥ ⌃ ⇧ (held for the next key), Esc, Tab, arrows and common shortcuts. A hardware keyboard works as on a Mac. On-screen typing assumes a US keyboard layout on the Mac; characters without a key are pasted.
+- **iPad with a mouse or trackpad:** the pointer, right click and scrolling go to the Mac.
+- **More menu:** desktops, Mission Control, Spotlight, switch app, lock, quality, connection details, and the clipboard: *Send Clipboard to Mac* and *Get Mac's Clipboard* (manual, because iOS asks for permission on every automatic read).
+- The session ends when the app goes to the background. Coming back offers to reconnect.
 
 ## Limits
 
