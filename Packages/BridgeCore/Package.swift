@@ -11,9 +11,17 @@ let package = Package(
         .package(url: "https://github.com/stasel/WebRTC.git", .upToNextMajor(from: "157.0.0")),
     ],
     targets: [
+        // Header-only bridge to CoreGraphics' private virtual-display classes.
+        .target(
+            name: "CGVirtualDisplayPrivate",
+            linkerSettings: [.linkedFramework("CoreGraphics")]
+        ),
         .target(
             name: "BridgeCore",
-            dependencies: [.product(name: "WebRTC", package: "WebRTC")],
+            dependencies: [
+                .product(name: "WebRTC", package: "WebRTC"),
+                "CGVirtualDisplayPrivate",
+            ],
             // WebRTC's Objective-C delegates call back on its own threads; Swift 5
             // mode keeps that bridging simple.
             swiftSettings: [.swiftLanguageMode(.v5)]

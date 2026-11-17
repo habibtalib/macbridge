@@ -144,6 +144,7 @@ public final class PeerSession: NSObject, @unchecked Sendable {
 
     /// Feed a signal that arrived from the other side.
     public func handle(_ signal: SignalPayload) {
+        Self.writeStats("signal in: \(Self.kind(signal)) (\(role))")
         queue.async {
             guard !self.isClosed else { return }
             switch signal {
@@ -215,6 +216,57 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Writes the video and connection counters to the system log
+    /// (`log stream --predicate 'eventMessage BEGINSWITH "MacBridgeStats"'`).
+    public func logStats() {
+        connection.statistics { report in
+            Self.writeStats("report \(report.statistics.count) stats")
+            let wanted: Set<String> = ["outbound-rtp", "inbound-rtp", "candidate-pair", "media-source"]
+            let keys: Set<String> = [
+                "kind", "framesEncoded", "framesSent", "framesDecoded", "framesReceived", "framesDropped",
+                "bytesSent", "bytesReceived", "frameWidth", "frameHeight", "framesPerSecond",
+                "encoderImplementation", "qualityLimitationReason", "keyFramesEncoded", "keyFramesDecoded",
+                "pliCount", "nackCount", "frames", "width", "height",
+                "state", "nominated", "currentRoundTripTime", "availableOutgoingBitrate",
+                "localCandidateId", "remoteCandidateId", "packetsLost",
+            ]
+            var candidates: [String: String] = [:]
+            for stat in report.statistics.values where stat.type == "local-candidate" || stat.type == "remote-candidate" {
+                candidates[stat.id] = [stat.values["candidateType"], stat.values["protocol"], stat.values["address"]].map { $0.map { "\($0)" } ?? "?" }.joined(separator: "/")
+            }
+            for stat in report.statistics.values where wanted.contains(stat.type) {
+                if stat.type == "candidate-pair", (stat.values["nominated"] as? NSNumber)?.boolValue != true { continue }
+                var fields = stat.values.filter { keys.contains($0.key) }.map { "\($0.key)=\($0.value)" }.sorted()
+                if let l = stat.values["localCandidateId"] { fields.append("local=\(candidates["\(l)"] ?? "?")") }
+                if let r = stat.values["remoteCandidateId"] { fields.append("remote=\(candidates["\(r)"] ?? "?")") }
+                Self.writeStats("\(stat.type) \(fields.joined(separator: " "))")
+            }
+        }
+    }
+
+    static func kind(_ signal: SignalPayload) -> String {
+        switch signal {
+        case .request: "request"
+        case .offer: "offer"
+        case .answer: "answer"
+        case let .candidate(sdp, _, _): "candidate \(sdp)"
+        case .bye: "bye"
+        }
+    }
+
+    /// Appends one line to ~/Library/Logs/MacBridge-stats.log.
+    public static func writeStats(_ line: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MacBridge-stats.log")
+        let text = "\(ISO8601DateFormatter().string(from: Date())) \(line)\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: url)
+        }
+    }
+
     // MARK: - Internals
 
     private static var noConstraints: RTCMediaConstraints {
@@ -225,7 +277,9 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         connection.setRemoteDescription(description) { [weak self] error in
             guard let self else { return }
             self.queue.async {
+                if let error { Self.writeStats("setRemote failed: \(error.localizedDescription)") }
                 guard error == nil, !self.isClosed else { return self.fail() }
+                Self.writeStats("remote description set, \(self.pendingCandidates.count) queued candidates")
                 self.hasRemoteDescription = true
                 self.pendingCandidates.forEach { self.connection.add($0) { _ in } }
                 self.pendingCandidates.removeAll()
@@ -262,10 +316,12 @@ public final class PeerSession: NSObject, @unchecked Sendable {
 
 extension PeerSession: RTCPeerConnectionDelegate {
     public func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+        Self.writeStats("local candidate: \(candidate.sdp)")
         onSignal?(.candidate(sdp: candidate.sdp, mLineIndex: candidate.sdpMLineIndex, mid: candidate.sdpMid))
     }
 
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
+        Self.writeStats("connection state: \(newState.rawValue)")
         switch newState {
         case .new, .connecting: onState?(.connecting)
         case .connected: onState?(.connected)
@@ -304,7 +360,9 @@ extension PeerSession: RTCPeerConnectionDelegate {
     public func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
     public func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     public func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
-    public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {}
+    public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        Self.writeStats("ice state: \(newState.rawValue)")
+    }
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
     public func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 }

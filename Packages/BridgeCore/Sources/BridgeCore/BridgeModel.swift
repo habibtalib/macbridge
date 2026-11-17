@@ -70,10 +70,15 @@ public final class BridgeModel: ObservableObject {
 
     private var hostSession: PeerSession?
     private var hostPeer: PairedDevice?
+    /// Ends a host session that stays disconnected; WebRTC may never report it as failed.
+    private var hostDisconnectTimer: Task<Void, Never>?
     private var injector: InputInjector?
     private let capturer = ScreenCapturer()
     private let power = PowerAssertions()
     private var hostDisplay: DisplayInfo?
+    /// Created for a session when this Mac has no usable screen (lid closed,
+    /// no monitor); removed when the session ends.
+    private var virtualDisplay: VirtualDisplay?
     private var hostQuality = QualityPreset.sharp
     private var currentLogEntry: UUID?
     /// Newest request accepted from each device, to refuse replays.
@@ -146,6 +151,7 @@ public final class BridgeModel: ObservableObject {
     }
 
     private func send(_ payload: SignalPayload, to peer: PairedDevice) {
+        PeerSession.writeStats("signal out to \(peer.name): \(PeerSession.kind(payload)) (server \(signaling == nil ? "none" : "ok"))")
         let auth = SessionAuth.sign(payload, to: peer.id, identity: identity)
         signaling?.send(SignalEnvelope(payload, auth: auth), to: peer.id)
     }
@@ -159,7 +165,11 @@ public final class BridgeModel: ObservableObject {
             requestTimestamp = try SessionAuth.verify(
                 payload, auth: envelope.auth, from: peer, to: deviceID, lastRequestTimestamp: lastRequest[peerID])
         } catch {
+            PeerSession.writeStats("signal from \(peer.name) rejected: \(error) (\(PeerSession.kind(payload)))")
             return
+        }
+        if peer.id != hostPeer?.id, payload != .request {
+            PeerSession.writeStats("signal from \(peer.name) ignored, no host session for it: \(PeerSession.kind(payload))")
         }
 
         if peer.id == controllerPeer?.id, peer.thisMacMayControl, payload != .request {
@@ -428,7 +438,9 @@ public final class BridgeModel: ObservableObject {
             return send(.bye, to: peer)
         }
         // One controller at a time: a new request replaces the current session.
-        endHosting(notify: true)
+        // A retry from the same device must not get a bye: it would end the
+        // attempt that the device has just started.
+        endHosting(notify: hostPeer?.id != peer.id)
         hostPeer = peer
         let servers = await iceServers()
         guard hostPeer == peer, hostSession == nil,
@@ -446,11 +458,20 @@ public final class BridgeModel: ObservableObject {
                 guard let self, self.hostSession === session else { return }
                 switch state {
                 case .connected:
+                    self.hostDisconnectTimer?.cancel()
+                    self.hostDisconnectTimer = nil
                     guard self.hostStatus == .idle else { break }
                     self.hostStatus = .sharing(to: peer)
                     self.logSessionStart(peer)
                 case .failed, .closed: self.endHosting(notify: false)
-                case .connecting, .disconnected: break
+                case .disconnected:
+                    guard self.hostDisconnectTimer == nil else { break }
+                    self.hostDisconnectTimer = Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 10_000_000_000)
+                        guard !Task.isCancelled, let self, self.hostSession === session else { return }
+                        self.endHosting(notify: true)
+                    }
+                case .connecting: break
                 }
             }
         }
@@ -459,7 +480,7 @@ public final class BridgeModel: ObservableObject {
             // A sleeping display gives the capturer nothing to send.
             power.keepDisplayAwake = true
             hostQuality = .sharp
-            let display = try await startCapture(on: nil)
+            let display = try await startCapture(on: await displayForSession())
             guard hostSession === session else { return } // replaced while starting
             let injector = InputInjector(display: display)
             self.injector = injector
@@ -488,6 +509,13 @@ public final class BridgeModel: ObservableObject {
                 session?.push(buffer, timestampNs: timestampNs)
             }
             session.start()
+            PeerSession.writeStats("session started for \(peer.name)")
+            Task { @MainActor [weak self, weak session] in
+                while let self, let session, self.hostSession === session {
+                    session.logStats()
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            }
             if !hasInputPermission {
                 notice = "\(peer.name) can see this screen but not control it: Accessibility is not allowed for MacBridge."
             }
@@ -496,6 +524,30 @@ public final class BridgeModel: ObservableObject {
             send(.bye, to: peer)
             endHosting(notify: false)
         }
+    }
+
+    /// The display a new session should show: nil (the main display) when
+    /// this Mac has a working screen, otherwise a virtual display created for
+    /// the session. A closed lid with no monitor would otherwise send black.
+    private func displayForSession() async -> CGDirectDisplayID? {
+        guard Headless.needsVirtualDisplay() else { return nil }
+        if virtualDisplay == nil {
+            do {
+                virtualDisplay = try VirtualDisplay()
+            } catch {
+                notice = "This Mac has no screen turned on (lid closed?) and a virtual display could not be created; the picture may be black."
+                return nil
+            }
+        }
+        guard let virtual = virtualDisplay, await virtual.waitUntilOnline() else { return nil }
+        // Capture may not list a brand-new display straight away.
+        for _ in 0..<20 {
+            if let displays = try? await ScreenCapturer.displays(), displays.contains(where: { $0.id == virtual.displayID }) {
+                return virtual.displayID
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return virtual.displayID
     }
 
     private func startCapture(on displayID: CGDirectDisplayID?) async throws -> DisplayInfo {
@@ -538,6 +590,8 @@ public final class BridgeModel: ObservableObject {
     private func endHosting(notify: Bool) {
         guard let peer = hostPeer else { return }
         if notify { send(.bye, to: peer) }
+        hostDisconnectTimer?.cancel()
+        hostDisconnectTimer = nil
         let session = hostSession
         hostSession = nil
         hostPeer = nil
@@ -551,7 +605,14 @@ public final class BridgeModel: ObservableObject {
         injector?.releaseAll()
         injector = nil
         session?.close()
-        Task { await capturer.stop() }
+        // The virtual display goes only after capture has stopped, so the
+        // stream does not end with an error first.
+        let virtual = virtualDisplay
+        virtualDisplay = nil
+        Task {
+            await capturer.stop()
+            withExtendedLifetime(virtual) {}
+        }
     }
 
     // MARK: - Session log

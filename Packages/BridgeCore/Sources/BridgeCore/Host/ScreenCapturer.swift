@@ -34,6 +34,13 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
 
     private let frameQueue = DispatchQueue(label: "macbridge.capture", qos: .userInteractive)
     private var stream: SCStream?
+    /// ScreenCaptureKit sends nothing while the screen is still. The last
+    /// frame is sent again on a timer so the viewer never waits on a lost or
+    /// not-yet-sent first frame (a black picture until something moves).
+    private var lastFrame: CVPixelBuffer?
+    private var lastFrameAt: TimeInterval = 0
+    private var repeatTimer: DispatchSourceTimer?
+    static let repeatInterval: TimeInterval = 0.5
 
     public override init() {}
 
@@ -74,19 +81,26 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         // NV12: what the hardware H.264 encoder takes without a conversion.
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
-        config.queueDepth = 3
+        // One buffer stays held as the frame to repeat.
+        config.queueDepth = 4
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         try await stream.startCapture()
         self.stream = stream
+        startRepeating()
         return info
     }
 
     public func stop() async {
         guard let stream else { return }
         self.stream = nil
+        frameQueue.sync {
+            repeatTimer?.cancel()
+            repeatTimer = nil
+            lastFrame = nil
+        }
         try? await stream.stopCapture()
     }
 
@@ -96,7 +110,32 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         guard type == .screen, sampleBuffer.isValid, Self.isCompleteFrame(sampleBuffer),
               let pixelBuffer = sampleBuffer.imageBuffer else { return }
         let seconds = sampleBuffer.presentationTimeStamp.seconds
+        lastFrame = pixelBuffer
+        lastFrameAt = Self.hostSeconds()
         onFrame?(pixelBuffer, Int64(seconds * 1_000_000_000))
+    }
+
+    /// On `frameQueue`, like the stream output, so the two never race.
+    private func startRepeating() {
+        frameQueue.sync {
+            repeatTimer?.cancel()
+            let timer = DispatchSource.makeTimerSource(queue: frameQueue)
+            timer.schedule(deadline: .now() + Self.repeatInterval, repeating: Self.repeatInterval)
+            timer.setEventHandler { [weak self] in
+                guard let self, let frame = self.lastFrame else { return }
+                let now = Self.hostSeconds()
+                guard now - self.lastFrameAt >= Self.repeatInterval else { return }
+                self.lastFrameAt = now
+                self.onFrame?(frame, Int64(now * 1_000_000_000))
+            }
+            repeatTimer = timer
+            timer.resume()
+        }
+    }
+
+    /// The host clock, the one ScreenCaptureKit stamps its frames with.
+    private static func hostSeconds() -> TimeInterval {
+        CMClockGetTime(CMClockGetHostTimeClock()).seconds
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
