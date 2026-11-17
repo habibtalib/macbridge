@@ -67,6 +67,9 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     private var attempt = 0
     private var status: Status = .offline
     private var iceWaiters: [([IceServer]) -> Void] = []
+    private var presenceWaiters: [(Set<String>?) -> Void] = []
+    /// An older server closes the connection on a presence request: ask once, then never again.
+    private var presenceUnsupported = false
 
     public init(url: URL, identity: Identity, accessToken: String? = nil) {
         self.url = url
@@ -108,6 +111,28 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             self.iceWaiters.append(finish)
             self.write(.ice, on: task)
             self.queue.asyncAfter(deadline: .now() + timeout) { finish([]) }
+        }
+    }
+
+    /// Asks which of these devices are connected to the server. `completion` gets the connected ones,
+    /// or nil when the server gave no answer (offline, or a server from before this request existed).
+    public func presence(of ids: [String], timeout: TimeInterval = 3, completion: @escaping (Set<String>?) -> Void) {
+        queue.async {
+            guard let task = self.task, self.status == .online, !self.presenceUnsupported, !ids.isEmpty else {
+                return DispatchQueue.main.async { completion(nil) }
+            }
+            var finished = false
+            let finish: (Set<String>?) -> Void = { online in
+                guard !finished else { return }
+                finished = true
+                DispatchQueue.main.async { completion(online) }
+            }
+            self.presenceWaiters.append(finish)
+            self.write(.presence(ids: Array(ids.prefix(64))), on: task)
+            self.queue.asyncAfter(deadline: .now() + timeout) {
+                self.presenceWaiters.removeAll()
+                finish(nil)
+            }
         }
     }
 
@@ -190,7 +215,20 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             DispatchQueue.main.async { self.onPairRequest?(from, sealed) }
         case let .pairReply(from, sealed):
             DispatchQueue.main.async { self.onPairReply?(from, sealed) }
+        case let .presence(online):
+            let waiters = presenceWaiters
+            presenceWaiters.removeAll()
+            waiters.forEach { $0(Set(online)) }
         case let .error(error):
+            if error == .other("bad-message"), !presenceWaiters.isEmpty {
+                // The server does not know the request. It closes the connection; the reconnect
+                // that follows must not ask again.
+                presenceUnsupported = true
+                let waiters = presenceWaiters
+                presenceWaiters.removeAll()
+                waiters.forEach { $0(nil) }
+                return
+            }
             if case .unauthorized = error { stop() }
             DispatchQueue.main.async { self.onError?(error) }
         }
@@ -249,12 +287,13 @@ private enum Outgoing: Encodable {
     case auth(signature: Data)
     case signal(to: String, data: SignalEnvelope)
     case ice
+    case presence(ids: [String])
     case pairOpen(tag: String)
     case pairClose
     case pair(tag: String, sealed: Data)
     case pairReply(to: String, sealed: Data)
 
-    private enum CodingKeys: String, CodingKey { case type, id, key, token, sig, to, data, tag }
+    private enum CodingKeys: String, CodingKey { case type, id, key, token, sig, to, data, tag, ids }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -273,6 +312,9 @@ private enum Outgoing: Encodable {
             try c.encode(data, forKey: .data)
         case .ice:
             try c.encode("ice", forKey: .type)
+        case let .presence(ids):
+            try c.encode("presence", forKey: .type)
+            try c.encode(ids, forKey: .ids)
         case let .pairOpen(tag):
             try c.encode("pair-open", forKey: .type)
             try c.encode(tag, forKey: .tag)
@@ -295,11 +337,12 @@ private enum Incoming: Decodable {
     case welcome
     case signal(from: String, SignalEnvelope)
     case ice([IceServer])
+    case presence(online: [String])
     case pair(from: String, sealed: Data)
     case pairReply(from: String, sealed: Data)
     case error(SignalingClient.ServerError)
 
-    private enum CodingKeys: String, CodingKey { case type, nonce, from, data, servers, code, to }
+    private enum CodingKeys: String, CodingKey { case type, nonce, from, data, servers, code, to, online }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -315,6 +358,8 @@ private enum Incoming: Decodable {
             )
         case "ice":
             self = .ice(try c.decode([IceServer].self, forKey: .servers))
+        case "presence":
+            self = .presence(online: try c.decode([String].self, forKey: .online))
         case "pair":
             self = .pair(
                 from: try c.decode(String.self, forKey: .from),

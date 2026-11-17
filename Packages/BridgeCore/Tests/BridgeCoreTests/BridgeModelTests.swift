@@ -156,6 +156,81 @@ struct BridgeModelTests {
         #expect(laptop.remoteVideo == nil)
     }
 
+    /// Studio shows a code, Laptop types it: Laptop may control Studio.
+    private func pairedModels(_ server: LocalServer) async throws -> (studio: BridgeModel, laptop: BridgeModel) {
+        let studio = makeModel("Studio", server: server), laptop = makeModel("Laptop", server: server)
+        studio.goOnline(); laptop.goOnline()
+        try await poll("both online") { studio.signalingStatus == .online && laptop.signalingStatus == .online }
+        studio.showPairingCode()
+        let code = try #require(shownCode(studio))
+        try await Task.sleep(for: .milliseconds(200))
+        laptop.pair(usingCode: code)
+        try await poll("paired") { studio.paired.count == 1 && laptop.paired.count == 1 }
+        return (studio, laptop)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func tilesShowWhichMacsAreOnline() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+
+        #expect(laptop.presence.isEmpty) // unknown until asked
+        laptop.refreshPresence()
+        try await poll("studio shown online") { laptop.presence[studio.deviceID] == true }
+        studio.goOffline()
+        try await Task.sleep(for: .milliseconds(300))
+        laptop.refreshPresence()
+        try await poll("studio shown offline") { laptop.presence[studio.deviceID] == false }
+        laptop.goOffline()
+        laptop.refreshPresence()
+        #expect(laptop.presence.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aMacSetToAskFirstWaitsForAnAnswer() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.allowsControl = true
+        let laptopAtStudio = try #require(studio.controllers.first)
+        let studioAtLaptop = try #require(laptop.controllable.first)
+        studio.setAsksFirst(laptopAtStudio, true)
+
+        // Declined by the person at Studio.
+        laptop.connect(to: studioAtLaptop)
+        try await poll("studio asks") { studio.pendingRequest?.peer.id == laptop.deviceID }
+        #expect(studio.hostStatus == .idle)
+        studio.declineRequest()
+        #expect(studio.pendingRequest == nil)
+        try await poll("laptop is told") { laptop.controllerStatus == .failed("Studio did not accept the connection") }
+        #expect(laptop.lastHost == studioAtLaptop)
+
+        // Nobody answers: declined by itself.
+        studio.askTimeout = 0.5
+        laptop.reconnect()
+        try await poll("studio asks again") { studio.pendingRequest != nil }
+        try await poll("times out") { studio.pendingRequest == nil }
+        try await poll("laptop is told again") { laptop.controllerStatus == .failed("Studio did not accept the connection") }
+        laptop.dismissFailure()
+        #expect(laptop.controllerStatus == .idle)
+
+        // The caller gives up while the question is showing.
+        studio.askTimeout = 30
+        laptop.connect(to: studioAtLaptop)
+        try await poll("studio asks a third time") { studio.pendingRequest != nil }
+        laptop.disconnect()
+        try await poll("question goes away") { studio.pendingRequest == nil }
+
+        // Turning control off answers no.
+        laptop.connect(to: studioAtLaptop)
+        try await poll("studio asks a fourth time") { studio.pendingRequest != nil }
+        studio.allowsControl = false
+        #expect(studio.pendingRequest == nil)
+    }
+
     @Test func pairedDevicesSurviveARestart() throws {
         let suite = "macbridge-tests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))

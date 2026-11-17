@@ -54,6 +54,8 @@ public final class PeerSession: NSObject, @unchecked Sendable {
     public var onInputReady: (() -> Void)?
     /// Controller: text was copied on the host.
     public var onClipboard: ((String) -> Void)?
+    /// Controller: the host's displays, sent when the session starts and when the shown display changes.
+    public var onDisplays: (([RemoteDisplay]) -> Void)?
 
     private static let reliableLabel = "input-reliable"
     private static let fastLabel = "input-fast"
@@ -216,6 +218,15 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// What the session window shows about the connection. Works on either side;
+    /// the picture numbers are for the video this side receives (controller) or sends (host).
+    public func sessionStats(_ completion: @escaping (SessionStats) -> Void) {
+        let role = role
+        connection.statistics { report in
+            completion(SessionStats(report.statistics.values.map { ($0.type, $0.id, $0.values) }, incoming: role == .controller))
+        }
+    }
+
     /// Writes the video and connection counters to the system log
     /// (`log stream --predicate 'eventMessage BEGINSWITH "MacBridgeStats"'`).
     public func logStats() {
@@ -369,7 +380,6 @@ extension PeerSession: RTCPeerConnectionDelegate {
 
 extension PeerSession: RTCDataChannelDelegate {
     public func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
-        guard role == .controller else { return }
         queue.async { self.reportInputReadyIfOpen() }
     }
 
@@ -380,7 +390,11 @@ extension PeerSession: RTCDataChannelDelegate {
         switch role {
         case .host: onInput?(message)
         case .controller:
-            if case let .clipboard(text) = message { onClipboard?(text) }
+            switch message {
+            case let .clipboard(text): onClipboard?(text)
+            case let .displays(list): onDisplays?(list)
+            default: break
+            }
         }
     }
 
@@ -419,5 +433,63 @@ final class ScreenCodecFactory: NSObject, RTCVideoEncoderFactory, RTCVideoDecode
 
     func createDecoder(_ info: RTCVideoCodecInfo) -> RTCVideoDecoder? {
         info.name == kRTCVideoCodecH264Name ? RTCVideoDecoderH264() : nil
+    }
+}
+
+/// A snapshot of a session's connection, read from WebRTC's counters.
+public struct SessionStats: Equatable, Sendable {
+    public var width = 0
+    public var height = 0
+    public var framesPerSecond = 0.0
+    /// Video bytes so far; two snapshots give the bit rate.
+    public var videoBytes: Int64 = 0
+    public var packetsLost = 0
+    public var packets = 0
+    /// Round trip between the two Macs, in milliseconds.
+    public var roundTripMs: Double?
+    /// The traffic goes through the relay server instead of straight between the Macs.
+    public var isRelayed: Bool?
+    /// "H264", and whether it is decoded or encoded in hardware.
+    public var codec: String?
+    public var usesHardware: Bool?
+    /// Filled in by the caller from two snapshots.
+    public var bitsPerSecond: Double?
+
+    public init() {}
+
+    public var lossPercent: Double? {
+        let total = packets + packetsLost
+        return total > 0 ? Double(packetsLost) / Double(total) * 100 : nil
+    }
+
+    init(_ stats: [(type: String, id: String, values: [String: NSObject])], incoming: Bool) {
+        func number(_ values: [String: NSObject], _ key: String) -> Double? { (values[key] as? NSNumber)?.doubleValue }
+        func text(_ values: [String: NSObject], _ key: String) -> String? { values[key] as? String }
+        var byID: [String: [String: NSObject]] = [:]
+        for stat in stats { byID[stat.id] = stat.values }
+
+        let rtp = incoming ? "inbound-rtp" : "outbound-rtp"
+        if let video = stats.first(where: { $0.type == rtp && (text($0.values, "kind") ?? text($0.values, "mediaType")) == "video" })?.values {
+            width = Int(number(video, "frameWidth") ?? 0)
+            height = Int(number(video, "frameHeight") ?? 0)
+            framesPerSecond = number(video, "framesPerSecond") ?? 0
+            videoBytes = Int64(number(video, incoming ? "bytesReceived" : "bytesSent") ?? 0)
+            packets = Int(number(video, incoming ? "packetsReceived" : "packetsSent") ?? 0)
+            packetsLost = Int(number(video, "packetsLost") ?? 0)
+            if let implementation = text(video, incoming ? "decoderImplementation" : "encoderImplementation") {
+                usesHardware = implementation.contains("VideoToolbox")
+            }
+            if let codecID = text(video, "codecId"), let mime = byID[codecID].flatMap({ text($0, "mimeType") }) {
+                codec = mime.replacingOccurrences(of: "video/", with: "")
+            }
+        }
+        // The pair in use: the transport names it; older builds mark it "nominated".
+        let selected = stats.first { $0.type == "transport" }.flatMap { text($0.values, "selectedCandidatePairId") }.flatMap { byID[$0] }
+            ?? stats.first { $0.type == "candidate-pair" && (number($0.values, "nominated") ?? 0) != 0 && text($0.values, "state") == "succeeded" }?.values
+        if let pair = selected {
+            roundTripMs = number(pair, "currentRoundTripTime").map { $0 * 1000 }
+            let types = ["localCandidateId", "remoteCandidateId"].compactMap { text(pair, $0) }.compactMap { byID[$0] }.compactMap { text($0, "candidateType") }
+            if !types.isEmpty { isRelayed = types.contains("relay") }
+        }
     }
 }

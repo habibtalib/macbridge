@@ -143,28 +143,40 @@ public struct InputCaptureView: NSViewRepresentable {
     }
 }
 
-/// Shortcuts macOS acts on before an app sees them, sent to the host from the toolbar.
+/// Shortcuts macOS acts on before an app sees them, sent to the host from the session window's menu.
 public enum RemoteShortcut: CaseIterable, Sendable {
-    case previousDesktop, nextDesktop, missionControl
+    case previousDesktop, nextDesktop, missionControl, spotlight, appSwitcher, lockScreen
 
-    var keyCode: UInt16 {
+    /// The key, and the modifier keys held with it (their own key codes and flags).
+    private var keys: (keyCode: UInt16, modifiers: [(keyCode: UInt16, flag: NSEvent.ModifierFlags)], extra: NSEvent.ModifierFlags) {
+        let control: (UInt16, NSEvent.ModifierFlags) = (59, .control), command: (UInt16, NSEvent.ModifierFlags) = (55, .command)
         switch self {
-        case .previousDesktop: return 123 // ←
-        case .nextDesktop: return 124     // →
-        case .missionControl: return 126  // ↑
+        case .previousDesktop: return (123, [control], .function) // ⌃←
+        case .nextDesktop: return (124, [control], .function)     // ⌃→
+        case .missionControl: return (126, [control], .function)  // ⌃↑
+        case .spotlight: return (49, [command], [])               // ⌘Space
+        case .appSwitcher: return (48, [command], [])             // ⌘Tab: the app used before this one
+        case .lockScreen: return (12, [control, command], [])     // ⌃⌘Q
         }
     }
 
-    /// Control down, the arrow down and up, Control up: what the keyboard would send.
+    /// Modifiers down one by one, the key down and up, modifiers up again: what the keyboard would send.
     public var messages: [InputMessage] {
-        let control = InputMapping.wireModifiers([.control])
-        let arrow = InputMapping.wireModifiers([.control, .function])
-        return [
-            .key(keyCode: 59, isDown: true, modifiers: control),
-            .key(keyCode: keyCode, isDown: true, modifiers: arrow),
-            .key(keyCode: keyCode, isDown: false, modifiers: arrow),
-            .key(keyCode: 59, isDown: false, modifiers: 0),
-        ]
+        let keys = keys
+        var held: NSEvent.ModifierFlags = []
+        var out: [InputMessage] = []
+        for modifier in keys.modifiers {
+            held.insert(modifier.flag)
+            out.append(.key(keyCode: modifier.keyCode, isDown: true, modifiers: InputMapping.wireModifiers(held)))
+        }
+        let withKey = InputMapping.wireModifiers(held.union(keys.extra))
+        out.append(.key(keyCode: keys.keyCode, isDown: true, modifiers: withKey))
+        out.append(.key(keyCode: keys.keyCode, isDown: false, modifiers: withKey))
+        for modifier in keys.modifiers.reversed() {
+            held.remove(modifier.flag)
+            out.append(.key(keyCode: modifier.keyCode, isDown: false, modifiers: InputMapping.wireModifiers(held)))
+        }
+        return out
     }
 }
 

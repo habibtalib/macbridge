@@ -90,7 +90,7 @@ public final class InputInjector: @unchecked Sendable {
                 NSPasteboard.general.setString(text, forType: .string)
             }
 
-        case .nextDisplay, .quality:
+        case .nextDisplay, .quality, .selectDisplay, .displays:
             break // capture settings, handled by the session owner
         }
     }

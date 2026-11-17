@@ -14,6 +14,12 @@ import Testing
         .nextDisplay,
         .quality(.sharp),
         .quality(.light),
+        .selectDisplay(id: 69_734_112),
+        .displays([]),
+        .displays([
+            RemoteDisplay(id: 1, name: "Built-in Retina Display", pixelWidth: 3024, pixelHeight: 1964, isMain: true, isCurrent: false),
+            RemoteDisplay(id: 4_000_000_000, name: "Écran LG UltraFine", pixelWidth: 5120, pixelHeight: 2880, isMain: false, isCurrent: true),
+        ]),
     ])
     func roundTrips(_ message: InputMessage) throws {
         #expect(try InputMessage(decoding: message.encoded()) == message)
@@ -43,6 +49,19 @@ import Testing
         #expect(throws: InputMessageError.invalidCoordinate) {
             try InputMessage(decoding: InputMessage.scroll(dx: .infinity, dy: 0).encoded())
         }
+    }
+
+    @Test func longDisplayNamesAreCutAtACharacter() throws {
+        let name = String(repeating: "é", count: 40) // 80 bytes
+        let sent = InputMessage.displays([RemoteDisplay(id: 1, name: name, pixelWidth: 1, pixelHeight: 1, isMain: true, isCurrent: true)])
+        guard case let .displays(list) = try InputMessage(decoding: sent.encoded()) else { Issue.record("not a display list"); return }
+        #expect(list[0].name == String(repeating: "é", count: 32))
+    }
+
+    @Test func rejectsDisplayListsThatLieAboutTheirLength() {
+        #expect(throws: InputMessageError.tooShort) { try InputMessage(decoding: Data([1, 9, 2, 0, 0, 0, 1])) }
+        #expect(throws: InputMessageError.tooShort) { try InputMessage(decoding: Data([1, 9, 200])) }
+        #expect(throws: InputMessageError.tooShort) { try InputMessage(decoding: Data([1, 8, 0, 0])) }
     }
 
     @Test func rejectsMalformedInput() {

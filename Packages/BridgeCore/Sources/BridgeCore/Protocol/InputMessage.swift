@@ -15,6 +15,10 @@ public enum InputMessage: Equatable, Sendable {
     /// Show the host's next display instead of the current one.
     case nextDisplay
     case quality(QualityPreset)
+    /// Show this display of the host (an ID from the host's `displays` list).
+    case selectDisplay(id: UInt32)
+    /// Host to controller: the host's displays, and which one is being shown.
+    case displays([RemoteDisplay])
 
     public static let protocolVersion: UInt8 = 1
     /// Largest clipboard text sent in one message; WebRTC data channel
@@ -26,9 +30,33 @@ public enum InputMessage: Equatable, Sendable {
     public var prefersUnreliableChannel: Bool {
         switch self {
         case .mouseMove, .scroll: return true
-        case .mouseButton, .key, .clipboard, .nextDisplay, .quality: return false
+        case .mouseButton, .key, .clipboard, .nextDisplay, .quality, .selectDisplay, .displays: return false
         }
     }
+}
+
+/// One of the host's displays, as the controller's display menu shows it.
+public struct RemoteDisplay: Equatable, Sendable, Identifiable {
+    public var id: UInt32
+    public var name: String
+    public var pixelWidth: UInt32
+    public var pixelHeight: UInt32
+    public var isMain: Bool
+    /// The display the session is showing.
+    public var isCurrent: Bool
+
+    public init(id: UInt32, name: String, pixelWidth: UInt32, pixelHeight: UInt32, isMain: Bool, isCurrent: Bool) {
+        self.id = id
+        self.name = name
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.isMain = isMain
+        self.isCurrent = isCurrent
+    }
+
+    /// Longest name sent, in bytes; longer ones are cut.
+    public static let maxNameBytes = 64
+    public static let maxCount = 16
 }
 
 public enum MouseButton: UInt8, Sendable {
@@ -68,6 +96,8 @@ private enum MessageType: UInt8 {
     case clipboard = 5
     case nextDisplay = 6
     case quality = 7
+    case selectDisplay = 8
+    case displays = 9
 }
 
 extension InputMessage {
@@ -100,6 +130,24 @@ extension InputMessage {
         case let .quality(preset):
             w.u8(MessageType.quality.rawValue)
             w.u8(preset.rawValue)
+        case let .selectDisplay(id):
+            w.u8(MessageType.selectDisplay.rawValue)
+            w.u32(id)
+        case let .displays(list):
+            w.u8(MessageType.displays.rawValue)
+            let list = list.prefix(RemoteDisplay.maxCount)
+            w.u8(UInt8(list.count))
+            for display in list {
+                w.u32(display.id)
+                w.u32(display.pixelWidth)
+                w.u32(display.pixelHeight)
+                w.u8((display.isMain ? 1 : 0) | (display.isCurrent ? 2 : 0))
+                var name = Data(display.name.utf8.prefix(RemoteDisplay.maxNameBytes))
+                // Never cut a character in half.
+                while String(data: name, encoding: .utf8) == nil, !name.isEmpty { name.removeLast() }
+                w.u8(UInt8(name.count))
+                w.data.append(name)
+            }
         }
         return w.data
     }
@@ -145,6 +193,19 @@ extension InputMessage {
             let raw = try r.u8()
             guard let preset = QualityPreset(rawValue: raw) else { throw InputMessageError.unknownQuality(raw) }
             self = .quality(preset)
+        case .selectDisplay:
+            self = .selectDisplay(id: try r.u32())
+        case .displays:
+            let count = Int(try r.u8())
+            guard count <= RemoteDisplay.maxCount else { throw InputMessageError.tooShort }
+            var list: [RemoteDisplay] = []
+            for _ in 0..<count {
+                let id = try r.u32(), width = try r.u32(), height = try r.u32(), flags = try r.u8()
+                guard let name = String(data: try r.bytes(Int(try r.u8())), encoding: .utf8) else { throw InputMessageError.invalidText }
+                list.append(RemoteDisplay(id: id, name: name, pixelWidth: width, pixelHeight: height,
+                                          isMain: flags & 1 != 0, isCurrent: flags & 2 != 0))
+            }
+            self = .displays(list)
         }
     }
 }
@@ -192,6 +253,12 @@ private struct Reader {
     /// A normalised coordinate, clamped to 0...1.
     mutating func unit() throws -> Float {
         min(max(try finite(), 0), 1)
+    }
+
+    mutating func bytes(_ count: Int) throws -> Data {
+        guard offset + count <= bytes.count else { throw InputMessageError.tooShort }
+        defer { offset += count }
+        return Data(bytes[offset..<offset + count])
     }
 
     mutating func rest() -> Data {

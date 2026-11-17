@@ -45,6 +45,7 @@ struct MacBridgeApp: App {
 final class Launch: ObservableObject {
     /// Nil if the identity key could not be loaded from the keychain.
     let model: BridgeModel?
+    private var panels: HostPanels?
 
     init() {
         if Snapshot.isActive {
@@ -57,6 +58,7 @@ final class Launch: ObservableObject {
         // Online from launch, window or not: after a login-item start nobody
         // is there to click anything.
         if let model, model.canGoOnline { model.goOnline() }
+        panels = model.map(HostPanels.init)
     }
 }
 
@@ -64,10 +66,21 @@ struct RootView: View {
     @EnvironmentObject private var model: BridgeModel
 
     var body: some View {
-        if let video = model.remoteVideo {
-            SessionView(video: video)
-        } else {
+        switch model.controllerStatus {
+        case .idle:
             HomeView()
+        case let .calling(host), let .connected(host):
+            if let video = model.remoteVideo {
+                SessionView(video: video, host: host)
+            } else {
+                ConnectingView(name: model.displayName(host)) { model.disconnect() }
+            }
+        case let .failed(reason):
+            DroppedView(
+                name: model.lastHost.map(model.displayName), reason: reason,
+                reconnect: model.lastHost != nil && model.signalingStatus == .online ? { model.reconnect() } : nil,
+                close: { model.dismissFailure() }
+            )
         }
     }
 }
@@ -115,6 +128,21 @@ private struct MenuBarContent: View {
         Button("Open MacBridge") {
             openWindow(id: "main")
             NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+        if !model.controllable.isEmpty {
+            Menu("Connect to") {
+                ForEach(model.controllableSorted) { device in
+                    Button {
+                        openWindow(id: "main")
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                        model.connect(to: device)
+                    } label: {
+                        // Menus draw text only: the dot says what the server last reported.
+                        Text((model.presence[device.id] == true ? "● " : model.presence[device.id] == false ? "○ " : "") + model.displayName(device))
+                    }
+                }
+            }
+            .disabled(model.signalingStatus != .online)
         }
         Toggle("Allow This Mac to Be Controlled", isOn: $model.allowsControl)
         Divider()

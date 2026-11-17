@@ -83,10 +83,21 @@ import Testing
         ])
         #expect(RemoteShortcut.previousDesktop.messages[1] == .key(keyCode: 123, isDown: true, modifiers: arrow))
         #expect(RemoteShortcut.missionControl.messages[1] == .key(keyCode: 126, isDown: true, modifiers: arrow))
-        // Every shortcut lets go of what it pressed.
+        let command = UInt32(CGEventFlags.maskCommand.rawValue)
+        #expect(RemoteShortcut.spotlight.messages == [
+            .key(keyCode: 55, isDown: true, modifiers: command),
+            .key(keyCode: 49, isDown: true, modifiers: command),
+            .key(keyCode: 49, isDown: false, modifiers: command),
+            .key(keyCode: 55, isDown: false, modifiers: 0),
+        ])
+        #expect(RemoteShortcut.lockScreen.messages.count == 6)
+        // Every shortcut lets go of what it pressed, in the reverse order, ending with nothing held.
         for shortcut in RemoteShortcut.allCases {
-            #expect(shortcut.messages.filter { if case .key(_, true, _) = $0 { true } else { false } }.count == 2)
-            #expect(shortcut.messages.last == .key(keyCode: 59, isDown: false, modifiers: 0))
+            let downs = shortcut.messages.compactMap { if case let .key(code, true, _) = $0 { code } else { nil } }
+            let ups = shortcut.messages.compactMap { if case let .key(code, false, _) = $0 { code } else { nil } }
+            #expect(downs == ups.reversed())
+            guard case let .key(_, false, last) = shortcut.messages.last else { Issue.record("does not end with a key up"); continue }
+            #expect(last == 0)
         }
     }
 }

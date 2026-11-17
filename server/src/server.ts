@@ -35,6 +35,8 @@ const MAX_MESSAGE_BYTES = 64 * 1024;
 const HELLO_TIMEOUT_MS = 5_000;
 const PING_INTERVAL_MS = 30_000;
 const PAIRING_LIFETIME_MS = 10 * 60_000;
+/** Most device IDs one presence request may name. */
+const MAX_PRESENCE_IDS = 64;
 
 /** Application close codes (4000–4999 are free for private use). */
 export const CLOSE = {
@@ -240,6 +242,19 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
           if (options.stunUrls?.length) servers.push({ urls: options.stunUrls });
           if (options.turn) servers.push(turnCredentials(options.turn, client.id, now()));
           return send(socket, { type: "ice", servers });
+        }
+
+        case "presence": {
+          // Which of these devices are connected. Only IDs the client already knows are answered,
+          // so the server never lists who is online.
+          const { ids } = message as Record<string, unknown>;
+          if (!Array.isArray(ids) || ids.length > MAX_PRESENCE_IDS) return reject("bad-message");
+          const online: string[] = [];
+          for (const one of ids) {
+            if (typeof one !== "string" || !ID_PATTERN.test(one)) return reject("bad-message");
+            if (devices.has(one)) online.push(one);
+          }
+          return send(socket, { type: "presence", online });
         }
 
         case "pair-open": {

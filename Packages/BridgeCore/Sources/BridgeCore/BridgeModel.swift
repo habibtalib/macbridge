@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CoreGraphics
 import Foundation
@@ -19,6 +20,13 @@ public final class BridgeModel: ObservableObject {
         case sharing(to: PairedDevice)
     }
 
+    public struct PendingRequest: Equatable, Sendable {
+        public var peer: PairedDevice
+        /// Without an answer by then, the request is declined.
+        public var deadline: Date
+    }
+
+
     public enum PairingStatus: Equatable {
         case idle
         /// This Mac is showing a code for another Mac to type.
@@ -36,7 +44,10 @@ public final class BridgeModel: ObservableObject {
     @Published public var allowsControl: Bool {
         didSet {
             defaults.set(allowsControl, forKey: Keys.allowsControl)
-            if !allowsControl { endHosting(notify: true) }
+            if !allowsControl {
+                declineRequest()
+                endHosting(notify: true)
+            }
             updatePower()
         }
     }
@@ -56,6 +67,16 @@ public final class BridgeModel: ObservableObject {
     @Published public private(set) var pairingStatus: PairingStatus = .idle
     @Published public private(set) var remoteVideo: RemoteVideo?
     @Published public private(set) var remoteVideoSize: CGSize?
+    /// The host's displays, for the session window's display menu. Empty with an older host.
+    @Published public private(set) var remoteDisplays: [RemoteDisplay] = []
+    /// Connection figures for the session window, refreshed every second while connected.
+    @Published public private(set) var sessionStats: SessionStats?
+    /// A Mac set to "ask first" wants to connect and waits for Accept or Decline here.
+    @Published public private(set) var pendingRequest: PendingRequest?
+    /// When the session in which this Mac is being controlled started.
+    @Published public private(set) var hostSince: Date?
+    /// The Mac the last session was with, so a dropped session can be started again.
+    @Published public private(set) var lastHost: PairedDevice?
     @Published public private(set) var notice: String?
     @Published public private(set) var hasScreenPermission = ScreenCapturer.hasPermission
     @Published public private(set) var hasInputPermission = InputInjector.hasPermission
@@ -127,6 +148,22 @@ public final class BridgeModel: ObservableObject {
     public var controllable: [PairedDevice] { paired.filter(\.thisMacMayControl) }
     /// Devices that can control this Mac.
     public var controllers: [PairedDevice] { paired.filter(\.mayControlThisMac) }
+
+    /// Asks the server which paired Macs are connected. Called while the list of Macs is on screen.
+    public func refreshPresence() {
+        let ids = paired.map(\.id)
+        guard let signaling, signalingStatus == .online, !ids.isEmpty else {
+            if !presence.isEmpty { presence = [:] }
+            return
+        }
+        signaling.presence(of: ids) { [weak self] online in
+            Task { @MainActor in
+                guard let self else { return }
+                let fresh = online.map { online in Dictionary(uniqueKeysWithValues: ids.map { ($0, online.contains($0)) }) } ?? [:]
+                if fresh != self.presence { self.presence = fresh }
+            }
+        }
+    }
 
     // MARK: - Names, favourites, last use
 
@@ -222,7 +259,9 @@ public final class BridgeModel: ObservableObject {
 
         if peer.id == controllerPeer?.id, peer.thisMacMayControl, payload != .request {
             if payload == .bye {
-                endControlling(.failed("\(peer.name) ended the session"))
+                // Before any picture arrived, a bye means the other Mac said no.
+                let refused = remoteVideo == nil
+                endControlling(.failed(refused ? "\(displayName(peer)) did not accept the connection" : "\(displayName(peer)) ended the session"))
             } else {
                 controllerSession?.handle(payload)
             }
@@ -232,8 +271,15 @@ public final class BridgeModel: ObservableObject {
         case .request:
             guard peer.mayControlThisMac else { return }
             lastRequest[peerID] = requestTimestamp
-            Task { await beginHosting(for: peer) }
+            // A Mac set to "ask first" waits for someone here to accept, unless it is already
+            // in a session with this Mac (the request is then a retry).
+            if meta[peer.id]?.asksFirst == true, hostPeer?.id != peer.id, allowsControl {
+                ask(about: peer)
+            } else {
+                Task { await beginHosting(for: peer) }
+            }
         case .bye:
+            if peer.id == pendingRequest?.peer.id { clearPendingRequest() }
             if peer.id == hostPeer?.id { endHosting(notify: false) }
         case .answer, .candidate:
             if peer.id == hostPeer?.id { hostSession?.handle(payload) }
@@ -391,6 +437,7 @@ public final class BridgeModel: ObservableObject {
         guard signalingStatus == .online, let host = controllable.first(where: { $0.id == host.id }) else { return }
         disconnect()
         controllerPeer = host
+        lastHost = host
         controllerStatus = .calling(host)
         Task {
             let servers = await iceServers()
@@ -424,6 +471,7 @@ public final class BridgeModel: ObservableObject {
                 case .connected:
                     self.controllerStatus = .connected(host)
                     self.updateMeta(host.id) { $0.lastConnected = Date() }
+                    self.startStatsPolling(session)
                     guard self.controllerClipboard == nil else { break }
                     let clipboard = ClipboardSync()
                     clipboard.onLocalCopy = { [weak session] text in session?.send(.clipboard(text: text)) }
@@ -441,7 +489,46 @@ public final class BridgeModel: ObservableObject {
                 self.controllerClipboard?.receive(text)
             }
         }
+        session.onDisplays = { [weak self] displays in
+            Task { @MainActor in
+                guard let self, self.controllerSession === session else { return }
+                self.remoteDisplays = displays
+            }
+        }
         send(.request, to: host)
+    }
+
+    /// Connects again to the Mac of the session that just ended or failed.
+    public func reconnect() {
+        guard let lastHost else { return }
+        connect(to: lastHost)
+    }
+
+    /// Leaves a failed session's screen and goes back to the list of Macs.
+    public func dismissFailure() {
+        if case .failed = controllerStatus { controllerStatus = .idle }
+    }
+
+    public func selectDisplay(_ display: RemoteDisplay) {
+        controllerSession?.send(.selectDisplay(id: display.id))
+    }
+
+    private func startStatsPolling(_ session: PeerSession) {
+        Task { @MainActor [weak self, weak session] in
+            var previous: (bytes: Int64, at: Date)?
+            while let self, let session, self.controllerSession === session {
+                let stats: SessionStats = await withCheckedContinuation { done in session.sessionStats { done.resume(returning: $0) } }
+                guard self.controllerSession === session else { return }
+                var shown = stats
+                let now = Date()
+                if let previous, now > previous.at, stats.videoBytes >= previous.bytes {
+                    shown.bitsPerSecond = Double(stats.videoBytes - previous.bytes) * 8 / now.timeIntervalSince(previous.at)
+                }
+                previous = (stats.videoBytes, now)
+                self.sessionStats = shown
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
     }
 
     /// Presses a shortcut on the host that this Mac's keyboard cannot send, because macOS acts on it here first.
@@ -473,11 +560,51 @@ public final class BridgeModel: ObservableObject {
         controllerClipboard = nil
         remoteVideo = nil
         remoteVideoSize = nil
+        remoteDisplays = []
+        sessionStats = nil
         controllerStatus = status
         session?.close()
     }
 
     // MARK: - Being controlled
+
+    private var askTimer: Task<Void, Never>?
+    /// How long an "ask first" request waits for an answer before it is declined.
+    public var askTimeout: TimeInterval = 30
+
+    private func ask(about peer: PairedDevice) {
+        let timeout = askTimeout
+        // The same Mac asking again (it retries while waiting) keeps the question that is showing.
+        if pendingRequest?.peer.id == peer.id { return }
+        if let other = pendingRequest?.peer { send(.bye, to: other) }
+        askTimer?.cancel()
+        pendingRequest = PendingRequest(peer: peer, deadline: Date().addingTimeInterval(timeout))
+        askTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.pendingRequest?.peer.id == peer.id else { return }
+            self.declineRequest()
+        }
+    }
+
+    private func clearPendingRequest() {
+        askTimer?.cancel()
+        askTimer = nil
+        pendingRequest = nil
+    }
+
+    /// Lets the waiting Mac in.
+    public func acceptRequest() {
+        guard let peer = pendingRequest?.peer else { return }
+        clearPendingRequest()
+        Task { await beginHosting(for: peer) }
+    }
+
+    /// Turns the waiting Mac away.
+    public func declineRequest() {
+        guard let peer = pendingRequest?.peer else { return }
+        clearPendingRequest()
+        send(.bye, to: peer)
+    }
 
     private func beginHosting(for peer: PairedDevice) async {
         guard allowsControl else { return send(.bye, to: peer) }
@@ -511,6 +638,7 @@ public final class BridgeModel: ObservableObject {
                     self.hostDisconnectTimer = nil
                     guard self.hostStatus == .idle else { break }
                     self.hostStatus = .sharing(to: peer)
+                    self.hostSince = Date()
                     self.logSessionStart(peer)
                 case .failed, .closed: self.endHosting(notify: false)
                 case .disconnected:
@@ -545,13 +673,19 @@ public final class BridgeModel: ObservableObject {
                         guard let self, self.hostSession === session else { return }
                         self.hostClipboard?.receive(text)
                     }
-                case .nextDisplay, .quality:
+                case .nextDisplay, .quality, .selectDisplay:
                     Task { @MainActor in
                         guard let self, self.hostSession === session else { return }
                         await self.reconfigureCapture(message)
                     }
                 default:
                     injector.handle(message)
+                }
+            }
+            session.onInputReady = { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.hostSession === session else { return }
+                    await self.sendDisplays()
                 }
             }
             capturer.onFrame = { [weak session] buffer, timestampNs in
@@ -621,6 +755,10 @@ public final class BridgeModel: ObservableObject {
             guard let displays = try? await ScreenCapturer.displays(), displays.count > 1 else { return }
             let index = displays.firstIndex { $0.id == hostDisplay?.id } ?? -1
             target = displays[(index + 1) % displays.count].id
+        case let .selectDisplay(id):
+            guard id != hostDisplay?.id, let displays = try? await ScreenCapturer.displays(),
+                  displays.contains(where: { $0.id == id }) else { return }
+            target = id
         default:
             return
         }
@@ -629,6 +767,22 @@ public final class BridgeModel: ObservableObject {
         // Nothing may stay held on the display being left.
         injector?.releaseAll()
         injector?.setDisplay(display)
+        await sendDisplays()
+    }
+
+    /// Tells the controller which displays this Mac has and which one it is looking at.
+    private func sendDisplays() async {
+        guard let session = hostSession, let displays = try? await ScreenCapturer.displays(), hostSession === session else { return }
+        var names: [CGDirectDisplayID: String] = [:]
+        for screen in NSScreen.screens {
+            if let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID { names[id] = screen.localizedName }
+        }
+        let list = displays.enumerated().map { index, display in
+            RemoteDisplay(id: display.id, name: names[display.id] ?? "Display \(index + 1)",
+                          pixelWidth: UInt32(display.pixelSize.width), pixelHeight: UInt32(display.pixelSize.height),
+                          isMain: display.isMain, isCurrent: display.id == hostDisplay?.id)
+        }
+        session.send(.displays(list))
     }
 
     /// Ends the session in which this Mac is being controlled.
@@ -645,6 +799,7 @@ public final class BridgeModel: ObservableObject {
         hostSession = nil
         hostPeer = nil
         hostStatus = .idle
+        hostSince = nil
         power.keepDisplayAwake = false
         hostDisplay = nil
         logSessionEnd()

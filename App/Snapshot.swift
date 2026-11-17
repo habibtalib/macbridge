@@ -6,7 +6,8 @@ import SwiftUI
 ///
 ///     MACBRIDGE_SNAPSHOT=/tmp/home.png MACBRIDGE_SNAPSHOT_VIEW=home MacBridge.app/Contents/MacOS/MacBridge
 ///
-/// Views: `home`, `empty`, `settings-general`, `settings-security`, `settings-connection`.
+/// Views: `home`, `empty`, `connecting`, `dropped`, `stats`, `host-panel`, `ask`, `settings-general`,
+/// `settings-security`, `settings-connection`.
 /// Nothing is read from or written to the real settings, and the app stays offline.
 @MainActor
 enum Snapshot {
@@ -51,6 +52,27 @@ enum Snapshot {
         case "settings-general", "settings-security", "settings-connection":
             content = AnyView(SettingsSnapshot(tab: String(view.dropFirst("settings-".count))))
             size = CGSize(width: 520, height: 520)
+        case "connecting":
+            content = AnyView(ConnectingView(name: "Studio") {})
+        case "dropped":
+            content = AnyView(DroppedView(name: "Studio", reason: "Connection to Studio failed", reconnect: {}, close: {}))
+        case "stats":
+            var stats = SessionStats()
+            stats.width = 2560; stats.height = 1600; stats.framesPerSecond = 59.6; stats.bitsPerSecond = 7_400_000
+            stats.packets = 120_000; stats.packetsLost = 36; stats.roundTripMs = 12.4; stats.isRelayed = false
+            stats.codec = "H264"; stats.usesHardware = true
+            content = AnyView(VStack(alignment: .leading, spacing: 0) {
+                ConnectionChip(name: "Studio", stats: stats).padding(8)
+                Divider()
+                StatsPanel(stats: stats)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background(Color(nsColor: .windowBackgroundColor)))
+            size = CGSize(width: 320, height: 250)
+        case "host-panel":
+            content = AnyView(HostPanelView(name: "MacBook Air", started: Date().addingTimeInterval(-754), end: {}))
+            size = CGSize(width: 320, height: 76)
+        case "ask":
+            content = AnyView(AskPanelView(name: "MacBook Air", deadline: Date().addingTimeInterval(24), accept: {}, decline: {}))
+            size = CGSize(width: 360, height: 150)
         default:
             content = AnyView(HomeView())
         }

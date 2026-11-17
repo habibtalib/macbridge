@@ -23,15 +23,21 @@ struct HomeView: View {
         .frame(minWidth: 760, minHeight: 500)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshPermissions()
+            model.refreshPresence()
         }
+        // The dots on the tiles: asked while this screen is showing.
+        .task(id: model.signalingStatus) {
+            while !Task.isCancelled {
+                model.refreshPresence()
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
+        .onChange(of: model.paired) { _, _ in model.refreshPresence() }
     }
 
     @ViewBuilder private var banners: some View {
         if let notice = model.notice {
             Banner(text: notice, symbol: "info.circle.fill", tint: .blue) { model.dismissNotice() }
-        }
-        if case let .failed(reason) = model.controllerStatus {
-            Banner(text: reason, symbol: "xmark.octagon.fill", tint: .red, dismiss: nil)
         }
     }
 }
@@ -310,4 +316,11 @@ enum Thumbnails {
     static func url(for deviceID: String) -> URL { folder.appendingPathComponent("\(deviceID).jpg") }
 
     static func image(for deviceID: String) -> NSImage? { NSImage(contentsOf: url(for: deviceID)) }
+
+    /// Keeps the last picture of a session as the Mac's tile picture.
+    @MainActor static func save(from video: RemoteVideo, for deviceID: String?) {
+        guard let deviceID, let data = video.thumbnailJPEG() else { return }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? data.write(to: url(for: deviceID), options: .atomic)
+    }
 }

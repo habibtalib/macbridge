@@ -60,6 +60,28 @@ import WebRTC
         try await poll("host clipboard on the controller") { !copied.value.isEmpty }
         #expect(copied.value == ["from the host"])
 
+        // Displays: the host's list reaches the controller; the controller's choice reaches the host.
+        let displays = Box<[RemoteDisplay]>([])
+        controller.onDisplays = { list in displays.update { $0 = list } }
+        let list = [RemoteDisplay(id: 7, name: "Studio Display", pixelWidth: 5120, pixelHeight: 2880, isMain: true, isCurrent: true)]
+        #expect(host.send(.displays(list)))
+        try await poll("display list on the controller") { !displays.value.isEmpty }
+        #expect(displays.value == list)
+        #expect(controller.send(.selectDisplay(id: 7)))
+        try await poll("display choice on the host") { received.value.contains(.selectDisplay(id: 7)) }
+
+        // What the session window shows about the connection.
+        let session = Box<SessionStats?>(nil)
+        controller.sessionStats { stats in session.update { $0 = stats } }
+        try await poll("session stats") { session.value != nil }
+        let shown = try #require(session.value)
+        #expect(shown.width == 640 && shown.height == 360)
+        #expect(shown.videoBytes > 0 && shown.packets > 0)
+        #expect(shown.codec == "H264")
+        #expect(shown.usesHardware == true)
+        #expect(shown.isRelayed == false)
+        #expect(shown.roundTripMs != nil)
+
         // The stream is hardware H.264 at the size that was pushed.
         let stats = Box<[[String: String]]>([])
         host.videoStats { report in stats.update { $0 = report } }

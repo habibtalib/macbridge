@@ -351,3 +351,35 @@ describe("ice servers", () => {
     expect(later.credential).not.toBe(first.credential);
   });
 });
+
+describe("presence", () => {
+  it("says which of the named devices are connected", async () => {
+    await start();
+    const a = await Device.online();
+    const b = await Device.online();
+    const gone = new Identity();
+    a.send({ type: "presence", ids: [b.id, gone.id, a.id] });
+    expect(await a.next()).toEqual({ type: "presence", online: [b.id, a.id] });
+    b.socket.close();
+    await b.closed;
+    a.send({ type: "presence", ids: [b.id] });
+    expect(await a.next()).toEqual({ type: "presence", online: [] });
+  });
+
+  it("refuses malformed or oversized requests", async () => {
+    await start();
+    for (const ids of [undefined, "x", [42], ["not an id!"], Array.from({ length: 65 }, () => new Identity().id)]) {
+      const device = await Device.online();
+      device.send({ type: "presence", ids });
+      expect(await device.next()).toEqual({ type: "error", code: "bad-message" });
+      expect(await device.closed).toBe(CLOSE.protocol);
+    }
+  });
+
+  it("is not answered before login", async () => {
+    await start();
+    const device = await Device.open();
+    device.send({ type: "presence", ids: [] });
+    expect(await device.next()).toEqual({ type: "error", code: "bad-message" });
+  });
+});
