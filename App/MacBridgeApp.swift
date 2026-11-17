@@ -14,10 +14,17 @@ struct MacBridgeApp: App {
                 KeychainErrorView()
             }
         }
+        .defaultSize(width: 860, height: 560)
         .commands {
             // The remote screen takes ⌘ shortcuts while it has focus, so the
             // local "New Window" item would only get in the way.
             CommandGroup(replacing: .newItem) {}
+        }
+
+        Settings {
+            if let model = launch.model {
+                SettingsView().environmentObject(model)
+            }
         }
 
         // Keeps the app running, and visibly so, with the window closed:
@@ -40,6 +47,12 @@ final class Launch: ObservableObject {
     let model: BridgeModel?
 
     init() {
+        if Snapshot.isActive {
+            let sample = Snapshot.sampleModel()
+            model = sample
+            DispatchQueue.main.async { Snapshot.run(model: sample) }
+            return
+        }
         model = (try? Identity.loadOrCreate()).map { BridgeModel(identity: $0) }
         // Online from launch, window or not: after a login-item start nobody
         // is there to click anything.

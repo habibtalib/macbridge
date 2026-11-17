@@ -42,6 +42,10 @@ public final class BridgeModel: ObservableObject {
     }
 
     @Published public private(set) var paired: [PairedDevice] = []
+    /// Alias, favourite and last use per paired device, by device ID.
+    @Published public private(set) var meta: [String: DeviceMeta] = [:]
+    /// Which paired devices are connected to the server right now. A device missing here is unknown.
+    @Published public private(set) var presence: [String: Bool] = [:]
     @Published public private(set) var signalingStatus: SignalingClient.Status = .offline {
         didSet { updatePower() }
     }
@@ -99,6 +103,8 @@ public final class BridgeModel: ObservableObject {
         allowsControl = defaults.bool(forKey: Keys.allowsControl)
         paired = defaults.data(forKey: Keys.paired)
             .flatMap { try? JSONDecoder().decode([PairedDevice].self, from: $0) } ?? []
+        meta = defaults.data(forKey: Keys.meta)
+            .flatMap { try? JSONDecoder().decode([String: DeviceMeta].self, from: $0) } ?? [:]
         sessionLog = defaults.data(forKey: Keys.sessionLog)
             .flatMap { try? JSONDecoder().decode([SessionLogEntry].self, from: $0) } ?? []
         // Public, and handy for provisioning: scripts/link-remote.sh pairs two
@@ -121,6 +127,48 @@ public final class BridgeModel: ObservableObject {
     public var controllable: [PairedDevice] { paired.filter(\.thisMacMayControl) }
     /// Devices that can control this Mac.
     public var controllers: [PairedDevice] { paired.filter(\.mayControlThisMac) }
+
+    // MARK: - Names, favourites, last use
+
+    /// The name a device is shown under on this Mac.
+    public func displayName(_ device: PairedDevice) -> String {
+        meta[device.id]?.alias ?? device.name
+    }
+
+    public var displayNames: [String: String] {
+        Dictionary(uniqueKeysWithValues: paired.map { ($0.id, displayName($0)) })
+    }
+
+    /// Devices this Mac can control: favourites first, then most recently used, then by name.
+    public var controllableSorted: [PairedDevice] {
+        controllable.sorted { a, b in
+            let ma = meta[a.id] ?? DeviceMeta(), mb = meta[b.id] ?? DeviceMeta()
+            if ma.isFavourite != mb.isFavourite { return ma.isFavourite }
+            if ma.lastConnected != mb.lastConnected { return (ma.lastConnected ?? .distantPast) > (mb.lastConnected ?? .distantPast) }
+            return displayName(a).localizedCaseInsensitiveCompare(displayName(b)) == .orderedAscending
+        }
+    }
+
+    /// An empty name removes the alias.
+    public func rename(_ device: PairedDevice, to alias: String) {
+        let trimmed = String(alias.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        updateMeta(device.id) { $0.alias = trimmed.isEmpty || trimmed == device.name ? nil : trimmed }
+    }
+
+    public func setFavourite(_ device: PairedDevice, _ favourite: Bool) {
+        updateMeta(device.id) { $0.isFavourite = favourite }
+    }
+
+    public func setAsksFirst(_ device: PairedDevice, _ asks: Bool) {
+        updateMeta(device.id) { $0.asksFirst = asks }
+    }
+
+    private func updateMeta(_ id: String, _ change: (inout DeviceMeta) -> Void) {
+        var entry = meta[id] ?? DeviceMeta()
+        change(&entry)
+        meta[id] = entry == DeviceMeta() ? nil : entry
+        defaults.set(try? JSONEncoder().encode(meta), forKey: Keys.meta)
+    }
 
     // MARK: - Signaling
 
@@ -375,6 +423,7 @@ public final class BridgeModel: ObservableObject {
                 switch state {
                 case .connected:
                     self.controllerStatus = .connected(host)
+                    self.updateMeta(host.id) { $0.lastConnected = Date() }
                     guard self.controllerClipboard == nil else { break }
                     let clipboard = ClipboardSync()
                     clipboard.onLocalCopy = { [weak session] text in session?.send(.clipboard(text: text)) }
@@ -664,6 +713,7 @@ public final class BridgeModel: ObservableObject {
         static let forcesRelay = "forcesRelay"
         static let paired = "pairedDevices"
         static let sessionLog = "sessionLog"
+        static let meta = "deviceMeta"
         static let publicKey = "publicKey"
     }
 
