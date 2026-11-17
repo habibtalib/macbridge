@@ -50,7 +50,8 @@ enum Snapshot {
         defaults.set("Dark-MBP", forKey: "deviceName")
         defaults.set("wss://bridge.example.com", forKey: "serverURL")
         defaults.set(true, forKey: "allowsControl")
-        return BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory(""))
+        // A keeper that runs nothing: a snapshot must not touch the Mac's sleep setting.
+        return BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory(""), lidKeeper: LidClosedKeeper(run: { _ in }))
     }
 
     static func run(model: BridgeModel) {

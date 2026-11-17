@@ -82,6 +82,23 @@ private struct SecuritySettings: View {
                 Text("This Mac stays awake while it can be controlled.")
             }
 
+            if model.hasLid {
+                Section {
+                    Picker("With the lid closed", selection: $model.lidClosedMode) {
+                        Text("Sleep as usual").tag(LidClosedMode.off)
+                        Text("Stay reachable on the power adapter").tag(LidClosedMode.onPower)
+                        Text("Always stay reachable").tag(LidClosedMode.always)
+                    }
+                    .disabled(!model.canStayAwakeLidClosed)
+                } footer: {
+                    if model.canStayAwakeLidClosed {
+                        Text("Applies while Allow control is on and this Mac is online. A closed Mac is shown to the other Mac on a virtual display. LidAwake does the holding, and its battery and heat limits still apply. A closed Mac that stays awake in a bag gets hot: \"on the power adapter\" is the safe choice.")
+                    } else {
+                        Text("Needs LidAwake on this Mac (the lidawake command was not found). macOS only lets an administrator switch off lid-close sleep, and LidAwake holds that permission.")
+                    }
+                }
+            }
+
             Section("Macs that can control this Mac") {
                 if model.controllers.isEmpty {
                     Text("None. Show a pairing code in the main window to add one.").foregroundStyle(.secondary)

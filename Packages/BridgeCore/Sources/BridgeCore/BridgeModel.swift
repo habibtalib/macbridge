@@ -52,6 +52,17 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
+    /// What this Mac does with its lid closed while it allows control (laptops only).
+    @Published public var lidClosedMode: LidClosedMode {
+        didSet {
+            defaults.set(lidClosedMode.rawValue, forKey: Keys.lidClosedMode)
+            updatePower()
+        }
+    }
+    /// Staying awake with the lid closed needs LidAwake on this Mac.
+    public var canStayAwakeLidClosed: Bool { lidKeeper.isAvailable }
+    public let hasLid = LidAndPower.hasLid
+
     @Published public private(set) var paired: [PairedDevice] = []
     /// Alias, favourite and last use per paired device, by device ID.
     @Published public private(set) var meta: [String: DeviceMeta] = [:]
@@ -100,6 +111,8 @@ public final class BridgeModel: ObservableObject {
     private var injector: InputInjector?
     private let capturer = ScreenCapturer()
     private let power = PowerAssertions()
+    private let lidKeeper: LidClosedKeeper
+    private var lidTimer: Task<Void, Never>?
     private var hostDisplay: DisplayInfo?
     /// Created for a session when this Mac has no usable screen (lid closed,
     /// no monitor); removed when the session ends.
@@ -113,8 +126,11 @@ public final class BridgeModel: ObservableObject {
     private var typedCode: PairingCode?
     private var pairingTimeout: Task<Void, Never>?
 
-    public init(identity: Identity, defaults: UserDefaults = .standard, secrets: SecretStore = .keychain) {
+    public init(identity: Identity, defaults: UserDefaults = .standard, secrets: SecretStore = .keychain,
+                lidKeeper: LidClosedKeeper? = nil) {
         self.identity = identity
+        self.lidKeeper = lidKeeper ?? LidClosedKeeper()
+        lidClosedMode = defaults.string(forKey: Keys.lidClosedMode).flatMap(LidClosedMode.init) ?? .off
         self.defaults = defaults
         self.secrets = secrets
         serverURL = defaults.string(forKey: Keys.serverURL) ?? ""
@@ -140,6 +156,33 @@ public final class BridgeModel: ObservableObject {
     /// fall asleep, or it would drop off the server.
     private func updatePower() {
         power.keepSystemAwake = allowsControl && signaling != nil
+        updateLidHold()
+        // The power adapter may be unplugged, and a hold has to be renewed: look again every minute
+        // for as long as a hold could be wanted.
+        let watch = hasLid && lidClosedMode != .off && allowsControl && signaling != nil
+        if watch, lidTimer == nil {
+            lidTimer = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 60_000_000_000)
+                    self?.updateLidHold()
+                }
+            }
+        } else if !watch {
+            lidTimer?.cancel()
+            lidTimer = nil
+        }
+    }
+
+    private func updateLidHold() {
+        guard hasLid else { return }
+        lidKeeper.update(shouldHold: lidClosedMode.shouldHold(
+            allowsControl: allowsControl, isOnline: signaling != nil,
+            isOnPower: LidAndPower.isOnPowerAdapter, inSession: hostSession != nil))
+    }
+
+    /// Lets the Mac sleep again when MacBridge quits.
+    public func releaseLidHold() {
+        lidKeeper.update(shouldHold: false)
     }
 
     public var parsedServerURL: URL? { Self.parseServerURL(serverURL) }
@@ -622,6 +665,7 @@ public final class BridgeModel: ObservableObject {
         guard hostPeer == peer, hostSession == nil,
               let session = PeerSession(role: .host, iceServers: servers, relayOnly: forcesRelay) else { return }
         hostSession = session
+        updateLidHold()
 
         session.onSignal = { [weak self] payload in
             Task { @MainActor in
@@ -800,6 +844,7 @@ public final class BridgeModel: ObservableObject {
         hostPeer = nil
         hostStatus = .idle
         hostSince = nil
+        updateLidHold()
         power.keepDisplayAwake = false
         hostDisplay = nil
         logSessionEnd()
@@ -869,6 +914,7 @@ public final class BridgeModel: ObservableObject {
         static let paired = "pairedDevices"
         static let sessionLog = "sessionLog"
         static let meta = "deviceMeta"
+        static let lidClosedMode = "lidClosedMode"
         static let publicKey = "publicKey"
     }
 

@@ -64,12 +64,13 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
 ## On the Mac being controlled
 
 - A small panel in the top right corner says who is in control and for how long, with **End**. The menu bar icon turns red.
+- **With the lid closed** (Settings → Security, laptops only): *Sleep as usual*, *Stay reachable on the power adapter*, or *Always stay reachable*. It applies while Allow control is on and the Mac is online. The other Mac sees a virtual display, since the built-in screen is off. Staying awake needs [LidAwake](https://github.com/habibtalib/lidawake) installed: macOS only lets an administrator switch off lid-close sleep, and LidAwake holds that permission. Its battery and heat limits still apply. MacBridge turns it off again when control is switched off, the Mac goes offline or the app quits, unless you had turned LidAwake on yourself.
 - **Ask first** (Settings → Security, per Mac): that Mac must be accepted on this Mac before it can connect. No answer in 30 seconds declines. Leave it off for a Mac nobody sits at.
 
 ## Limits
 
 - After a restart the controlled Mac is reachable only once someone has logged in. Use automatic login if it must come back unattended.
-- It stays awake while control is allowed, but a closed laptop lid on battery still sleeps.
+- It stays awake while control is allowed. A closed laptop sleeps unless *With the lid closed* is set (see above).
 - No file transfer or audio.
 
 ## Security
