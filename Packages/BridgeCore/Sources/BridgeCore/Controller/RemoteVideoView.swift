@@ -1,4 +1,8 @@
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import CoreImage
 import SwiftUI
 import WebRTC
@@ -50,9 +54,17 @@ final class LatestFrame: NSObject, RTCVideoRenderer, @unchecked Sendable {
     }
 }
 
+#if os(macOS)
+typealias PlatformVideoView = RTCMTLNSVideoView
+typealias PlatformViewRepresentable = NSViewRepresentable
+#else
+typealias PlatformVideoView = RTCMTLVideoView
+typealias PlatformViewRepresentable = UIViewRepresentable
+#endif
+
 /// The remote screen. Renders a WebRTC video track with Metal and reports the
 /// stream's pixel size so the caller can keep the aspect ratio.
-public struct RemoteVideoView: NSViewRepresentable {
+public struct RemoteVideoView: PlatformViewRepresentable {
     private let track: RTCVideoTrack
     private let onVideoSize: (CGSize) -> Void
 
@@ -63,35 +75,46 @@ public struct RemoteVideoView: NSViewRepresentable {
 
     public func makeCoordinator() -> Coordinator { Coordinator() }
 
-    public func makeNSView(context: Context) -> RTCMTLNSVideoView {
-        let view = RTCMTLNSVideoView(frame: .zero)
+    private func make(_ context: Context) -> PlatformVideoView {
+        let view = PlatformVideoView(frame: .zero)
         view.delegate = context.coordinator
         context.coordinator.onVideoSize = onVideoSize
         context.coordinator.attach(track, to: view)
         return view
     }
 
-    public func updateNSView(_ view: RTCMTLNSVideoView, context: Context) {
+    private func update(_ view: PlatformVideoView, _ context: Context) {
         context.coordinator.onVideoSize = onVideoSize
         context.coordinator.attach(track, to: view)
     }
 
-    public static func dismantleNSView(_ view: RTCMTLNSVideoView, coordinator: Coordinator) {
-        coordinator.detach(from: view)
+    #if os(macOS)
+    public func makeNSView(context: Context) -> RTCMTLNSVideoView { make(context) }
+    public func updateNSView(_ view: RTCMTLNSVideoView, context: Context) { update(view, context) }
+    public static func dismantleNSView(_ view: RTCMTLNSVideoView, coordinator: Coordinator) { coordinator.detach(from: view) }
+    #else
+    public func makeUIView(context: Context) -> RTCMTLVideoView {
+        let view = make(context)
+        // The caller sizes the view to the picture's shape; never crop.
+        view.videoContentMode = .scaleAspectFit
+        return view
     }
+    public func updateUIView(_ view: RTCMTLVideoView, context: Context) { update(view, context) }
+    public static func dismantleUIView(_ view: RTCMTLVideoView, coordinator: Coordinator) { coordinator.detach(from: view) }
+    #endif
 
     public final class Coordinator: NSObject, RTCVideoViewDelegate {
         var onVideoSize: (CGSize) -> Void = { _ in }
         private var track: RTCVideoTrack?
 
-        func attach(_ newTrack: RTCVideoTrack, to view: RTCMTLNSVideoView) {
+        func attach(_ newTrack: RTCVideoTrack, to view: RTCVideoRenderer) {
             guard track !== newTrack else { return }
             track?.remove(view)
             track = newTrack
             newTrack.add(view)
         }
 
-        func detach(from view: RTCMTLNSVideoView) {
+        func detach(from view: RTCVideoRenderer) {
             track?.remove(view)
             track = nil
         }

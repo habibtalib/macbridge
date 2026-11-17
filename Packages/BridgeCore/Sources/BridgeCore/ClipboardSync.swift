@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 
 /// Keeps the clipboards of the two Macs in a session the same: text copied on
@@ -58,3 +59,20 @@ public final class ClipboardSync {
         return InputMapping.clipboardText(pasteboard.string(forType: .string))
     }
 }
+#else
+import Foundation
+
+/// On iPhone and iPad the clipboard is not watched: reading it makes iOS ask for permission each
+/// time. Text copied on the Mac is kept here until the person asks for it.
+@MainActor
+public final class ClipboardSync {
+    public var onLocalCopy: ((String) -> Void)?
+    public private(set) var latestRemote: String?
+
+    public init() {}
+    public func start() {}
+    public func stop() {}
+    public func poll() {}
+    public func receive(_ text: String) { latestRemote = text }
+}
+#endif

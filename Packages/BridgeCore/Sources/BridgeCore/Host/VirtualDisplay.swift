@@ -1,3 +1,4 @@
+#if os(macOS)
 import CGVirtualDisplayPrivate
 import CoreGraphics
 import Foundation
@@ -124,3 +125,4 @@ public enum Headless {
         return Array(ids.prefix(Int(count)))
     }
 }
+#endif

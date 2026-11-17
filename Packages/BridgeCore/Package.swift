@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "BridgeCore",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v17)],
     products: [
         .library(name: "BridgeCore", targets: ["BridgeCore"]),
     ],
@@ -20,7 +20,7 @@ let package = Package(
             name: "BridgeCore",
             dependencies: [
                 .product(name: "WebRTC", package: "WebRTC"),
-                "CGVirtualDisplayPrivate",
+                .target(name: "CGVirtualDisplayPrivate", condition: .when(platforms: [.macOS])),
             ],
             // WebRTC's Objective-C delegates call back on its own threads; Swift 5
             // mode keeps that bridging simple.

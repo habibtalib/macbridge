@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -157,3 +158,4 @@ public final class InputInjector: @unchecked Sendable {
         Int32(max(-10_000, min(10_000, value.rounded())))
     }
 }
+#endif

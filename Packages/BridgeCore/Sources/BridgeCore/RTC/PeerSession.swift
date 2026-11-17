@@ -267,7 +267,11 @@ public final class PeerSession: NSObject, @unchecked Sendable {
 
     /// Appends one line to ~/Library/Logs/MacBridge-stats.log.
     public static func writeStats(_ line: String) {
+        #if os(macOS)
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MacBridge-stats.log")
+        #else
+        let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("MacBridge-stats.log")
+        #endif
         let text = "\(ISO8601DateFormatter().string(from: Date())) \(line)\n"
         if let handle = try? FileHandle(forWritingTo: url) {
             handle.seekToEndOfFile()

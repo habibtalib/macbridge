@@ -1,6 +1,8 @@
 import Foundation
+#if os(macOS)
 import IOKit
 import IOKit.ps
+#endif
 
 /// What a laptop that allows control does when its lid is closed.
 public enum LidClosedMode: String, CaseIterable, Sendable {
@@ -23,6 +25,7 @@ public enum LidClosedMode: String, CaseIterable, Sendable {
     }
 }
 
+#if os(macOS)
 /// Facts about this Mac's lid and power.
 public enum LidAndPower {
     /// Macs with a lid report its state; desktops do not.
@@ -121,3 +124,4 @@ public final class LidClosedKeeper {
         }
     }
 }
+#endif

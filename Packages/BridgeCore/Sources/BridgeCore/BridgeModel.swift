@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Combine
 import CoreGraphics
 import Foundation
@@ -818,9 +820,11 @@ public final class BridgeModel: ObservableObject {
     private func sendDisplays() async {
         guard let session = hostSession, let displays = try? await ScreenCapturer.displays(), hostSession === session else { return }
         var names: [CGDirectDisplayID: String] = [:]
+        #if os(macOS)
         for screen in NSScreen.screens {
             if let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID { names[id] = screen.localizedName }
         }
+        #endif
         let list = displays.enumerated().map { index, display in
             RemoteDisplay(id: display.id, name: names[display.id] ?? "Display \(index + 1)",
                           pixelWidth: UInt32(display.pixelSize.width), pixelHeight: UInt32(display.pixelSize.height),
@@ -939,7 +943,7 @@ public final class BridgeModel: ObservableObject {
     }
 
     /// The computer's name reduced to plain characters.
-    nonisolated public static func defaultDeviceName(from hostName: String? = Host.current().localizedName) -> String {
+    nonisolated public static func defaultDeviceName(from hostName: String? = BridgeModel.systemDeviceName) -> String {
         let cleaned = (hostName ?? "")
             .folding(options: [.diacriticInsensitive], locale: nil)
             .map { $0.isASCII && ($0.isLetter || $0.isNumber) ? String($0) : "-" }
@@ -952,6 +956,15 @@ public final class BridgeModel: ObservableObject {
 
     /// A name supplied by another device, made safe to show: trimmed, capped,
     /// and never empty.
+    /// What the system calls this device.
+    nonisolated public static var systemDeviceName: String? {
+        #if os(macOS)
+        return Host.current().localizedName
+        #else
+        return ProcessInfo.processInfo.hostName
+        #endif
+    }
+
     nonisolated static func label(_ name: String, id: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: .controlCharacters).joined()

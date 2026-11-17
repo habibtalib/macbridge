@@ -1,3 +1,4 @@
+#if os(macOS)
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -187,3 +188,4 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         return (even(size.width), even(size.height))
     }
 }
+#endif

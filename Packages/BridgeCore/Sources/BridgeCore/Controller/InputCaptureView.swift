@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Carbon.HIToolbox
 import SwiftUI
@@ -142,81 +143,4 @@ public struct InputCaptureView: NSViewRepresentable {
         }
     }
 }
-
-/// Shortcuts macOS acts on before an app sees them, sent to the host from the session window's menu.
-public enum RemoteShortcut: CaseIterable, Sendable {
-    case previousDesktop, nextDesktop, missionControl, spotlight, appSwitcher, lockScreen
-
-    /// The key, and the modifier keys held with it (their own key codes and flags).
-    private var keys: (keyCode: UInt16, modifiers: [(keyCode: UInt16, flag: NSEvent.ModifierFlags)], extra: NSEvent.ModifierFlags) {
-        let control: (UInt16, NSEvent.ModifierFlags) = (59, .control), command: (UInt16, NSEvent.ModifierFlags) = (55, .command)
-        switch self {
-        case .previousDesktop: return (123, [control], .function) // ⌃←
-        case .nextDesktop: return (124, [control], .function)     // ⌃→
-        case .missionControl: return (126, [control], .function)  // ⌃↑
-        case .spotlight: return (49, [command], [])               // ⌘Space
-        case .appSwitcher: return (48, [command], [])             // ⌘Tab: the app used before this one
-        case .lockScreen: return (12, [control, command], [])     // ⌃⌘Q
-        }
-    }
-
-    /// Modifiers down one by one, the key down and up, modifiers up again: what the keyboard would send.
-    public var messages: [InputMessage] {
-        let keys = keys
-        var held: NSEvent.ModifierFlags = []
-        var out: [InputMessage] = []
-        for modifier in keys.modifiers {
-            held.insert(modifier.flag)
-            out.append(.key(keyCode: modifier.keyCode, isDown: true, modifiers: InputMapping.wireModifiers(held)))
-        }
-        let withKey = InputMapping.wireModifiers(held.union(keys.extra))
-        out.append(.key(keyCode: keys.keyCode, isDown: true, modifiers: withKey))
-        out.append(.key(keyCode: keys.keyCode, isDown: false, modifiers: withKey))
-        for modifier in keys.modifiers.reversed() {
-            held.remove(modifier.flag)
-            out.append(.key(keyCode: modifier.keyCode, isDown: false, modifiers: InputMapping.wireModifiers(held)))
-        }
-        return out
-    }
-}
-
-/// Pure conversions between AppKit events and the wire format.
-public enum InputMapping {
-    /// View coordinates (origin bottom-left) → 0...1 with the origin top-left.
-    public static func normalized(_ point: CGPoint, in size: CGSize) -> (x: Float, y: Float) {
-        guard size.width > 0, size.height > 0 else { return (0, 0) }
-        let x = min(max(point.x / size.width, 0), 1)
-        let y = min(max(1 - point.y / size.height, 0), 1)
-        return (Float(x), Float(y))
-    }
-
-    /// The modifier bits shared by AppKit and Core Graphics event flags.
-    public static func wireModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
-        UInt32(truncatingIfNeeded: flags.intersection([.capsLock, .shift, .control, .option, .command, .function]).rawValue)
-    }
-
-    public static func isPaste(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
-        keyCode == 9 && flags.intersection([.command, .control, .option]) == .command
-    }
-
-    /// Clipboard text worth sending: present, not empty, and small enough
-    /// for one message.
-    public static func clipboardText(_ text: String?) -> String? {
-        guard let text, !text.isEmpty, text.utf8.count <= InputMessage.maxClipboardBytes else { return nil }
-        return text
-    }
-
-    /// For a modifier key's own key code: whether that key is now held.
-    /// Returns nil for key codes that are not modifiers.
-    public static func modifierIsDown(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool? {
-        switch keyCode {
-        case 54, 55: return flags.contains(.command)
-        case 56, 60: return flags.contains(.shift)
-        case 58, 61: return flags.contains(.option)
-        case 59, 62: return flags.contains(.control)
-        case 57: return flags.contains(.capsLock)
-        case 63: return flags.contains(.function)
-        default: return nil
-        }
-    }
-}
+#endif
