@@ -14,6 +14,8 @@ enum Snapshot {
     static var path: String? { ProcessInfo.processInfo.environment["MACBRIDGE_SNAPSHOT"] }
     static var view: String { ProcessInfo.processInfo.environment["MACBRIDGE_SNAPSHOT_VIEW"] ?? "home" }
     static var isActive: Bool { path != nil }
+    /// The sample tile picture, removed again after the render.
+    private static var samplePicture: URL?
 
     static func sampleModel() -> BridgeModel {
         let suite = "macbridge-snapshot"
@@ -37,6 +39,13 @@ enum Snapshot {
             second.asksFirst = true
             meta[devices[1].id] = second
             defaults.set(try? JSONEncoder().encode(meta), forKey: "deviceMeta")
+            // One tile with a wide picture, to check that it keeps the tile's shape.
+            if let sample = NSImage(contentsOfFile: "/System/Library/CoreServices/DefaultDesktop.heic")?.tiffRepresentation,
+               let jpeg = NSBitmapImageRep(data: sample)?.representation(using: .jpeg, properties: [:]) {
+                try? FileManager.default.createDirectory(at: Thumbnails.folder, withIntermediateDirectories: true)
+                let url = Thumbnails.url(for: devices[0].id)
+                if !FileManager.default.fileExists(atPath: url.path), (try? jpeg.write(to: url)) != nil { samplePicture = url }
+            }
         }
         defaults.set("Dark-MBP", forKey: "deviceName")
         defaults.set("wss://bridge.example.com", forKey: "serverURL")
@@ -87,6 +96,7 @@ enum Snapshot {
                 host.cacheDisplay(in: host.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
             }
+            if let samplePicture { try? FileManager.default.removeItem(at: samplePicture) }
             exit(0)
         }
     }

@@ -173,7 +173,7 @@ private struct DeviceGrid: View {
             EmptyDevices()
         } else {
             ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 165, maximum: 240), spacing: 14)], alignment: .leading, spacing: 14) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 240), spacing: 18)], alignment: .leading, spacing: 18) {
                     ForEach(devices) { device in
                         DeviceTile(device: device)
                     }
@@ -266,25 +266,33 @@ private struct DeviceTile: View {
     }
 
     private var preview: some View {
-        ZStack {
-            if let image = Thumbnails.image(for: device.id) {
-                Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
-            } else {
-                LinearGradient(colors: [Color.accentColor.opacity(0.35), Color.accentColor.opacity(0.12)],
-                               startPoint: .topLeading, endPoint: .bottomTrailing)
-                Image(systemName: "desktopcomputer").font(.system(size: 34, weight: .light)).foregroundStyle(.white.opacity(0.9))
-            }
-            if isCalling {
-                Color.black.opacity(0.45)
-                VStack(spacing: 6) {
-                    ProgressView().controlSize(.small).tint(.white)
-                    Text("Connecting… click to cancel").font(.caption).foregroundStyle(.white)
+        // The picture is laid over a box of fixed shape, so a wide screenshot cannot widen the tile.
+        Color.clear
+            .aspectRatio(16 / 10, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                if let image = Thumbnails.image(for: device.id) {
+                    Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+                } else {
+                    ZStack {
+                        LinearGradient(colors: [Color.accentColor.opacity(0.35), Color.accentColor.opacity(0.12)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                        Image(systemName: "desktopcomputer").font(.system(size: 34, weight: .light)).foregroundStyle(.white.opacity(0.9))
+                    }
                 }
             }
-        }
-        .frame(maxWidth: .infinity)
-        .aspectRatio(16 / 10, contentMode: .fit)
-        .clipped()
+            .overlay {
+                if isCalling {
+                    ZStack {
+                        Color.black.opacity(0.45)
+                        VStack(spacing: 6) {
+                            ProgressView().controlSize(.small).tint(.white)
+                            Text("Connecting… click to cancel").font(.caption).foregroundStyle(.white)
+                        }
+                    }
+                }
+            }
+            .clipped()
     }
 
     private var lastUsed: String {
