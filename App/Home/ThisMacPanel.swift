@@ -11,6 +11,12 @@ struct ThisMacPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 40, height: 40)
+                    .accessibilityHidden(true)
+                Text("MacBridge").font(.title2.weight(.bold))
+            }
+            .padding(.bottom, 2)
+            HStack(spacing: 10) {
                 Image(systemName: "laptopcomputer").font(.system(size: 26)).foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("This Mac").font(.caption).foregroundStyle(.secondary)

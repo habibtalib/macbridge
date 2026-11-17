@@ -251,7 +251,7 @@ struct ConnectingView: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: "desktopcomputer").font(.system(size: 44, weight: .light)).foregroundStyle(.secondary)
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 88, height: 88).accessibilityHidden(true)
             Text("Connecting to \(name)…").font(.title2.weight(.semibold))
             ProgressView().controlSize(.small)
             Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
