@@ -3,7 +3,8 @@
 // Two screens, the front one with a pointer: one Mac's screen on another, and in control of it.
 import AppKit
 
-func draw(_ size: CGFloat) -> NSBitmapImageRep {
+/// `fullBleed`: iOS masks the icon itself, so the colour fills the square and nothing is rounded.
+func draw(_ size: CGFloat, fullBleed: Bool = false) -> NSBitmapImageRep {
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size), pixelsHigh: Int(size), bitsPerSample: 8,
                                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
                                bytesPerRow: 0, bitsPerPixel: 0)!
@@ -11,12 +12,19 @@ func draw(_ size: CGFloat) -> NSBitmapImageRep {
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
     let u = size / 1024 // the design is drawn on a 1024 grid
+    if fullBleed {
+        // Grow the 824 plate to the whole square, glyph and all.
+        ctx.translateBy(x: size / 2, y: size / 2)
+        ctx.scaleBy(x: 1024 / 824, y: 1024 / 824)
+        ctx.translateBy(x: -size / 2, y: -size / 2)
+    }
 
     // macOS icon shape: 824 square, centred, with a soft shadow below.
     let plate = CGRect(x: 100 * u, y: 100 * u, width: 824 * u, height: 824 * u)
-    let platePath = CGPath(roundedRect: plate, cornerWidth: 185 * u, cornerHeight: 185 * u, transform: nil)
+    let platePath = fullBleed ? CGPath(rect: plate, transform: nil)
+        : CGPath(roundedRect: plate, cornerWidth: 185 * u, cornerHeight: 185 * u, transform: nil)
     ctx.saveGState()
-    ctx.setShadow(offset: CGSize(width: 0, height: -10 * u), blur: 24 * u, color: NSColor.black.withAlphaComponent(0.3).cgColor)
+    if !fullBleed { ctx.setShadow(offset: CGSize(width: 0, height: -10 * u), blur: 24 * u, color: NSColor.black.withAlphaComponent(0.3).cgColor) }
     ctx.addPath(platePath)
     ctx.setFillColor(NSColor(srgbRed: 0.16, green: 0.25, blue: 0.80, alpha: 1).cgColor)
     ctx.fillPath()
@@ -88,3 +96,16 @@ let contents: [String: Any] = ["images": images, "info": ["author": "xcode", "ve
 try JSONSerialization.data(withJSONObject: contents, options: [.prettyPrinted, .sortedKeys]).write(to: folder.appendingPathComponent("Contents.json"))
 try #"{"info":{"author":"xcode","version":1}}"#.write(to: folder.deletingLastPathComponent().appendingPathComponent("Contents.json"), atomically: true, encoding: .utf8)
 print("wrote \(images.count) sizes to \(folder.path)")
+
+// iPhone and iPad: one 1024 px image, no transparency.
+let mobile = URL(fileURLWithPath: "Mobile/Assets.xcassets/AppIcon.appiconset", isDirectory: true)
+try FileManager.default.createDirectory(at: mobile, withIntermediateDirectories: true)
+let flat = CGContext(data: nil, width: 1024, height: 1024, bitsPerComponent: 8, bytesPerRow: 0,
+                     space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+flat.draw(draw(1024, fullBleed: true).cgImage!, in: CGRect(x: 0, y: 0, width: 1024, height: 1024))
+try NSBitmapImageRep(cgImage: flat.makeImage()!).representation(using: .png, properties: [:])!.write(to: mobile.appendingPathComponent("icon_1024.png"))
+let mobileContents: [String: Any] = ["images": [["idiom": "universal", "platform": "ios", "size": "1024x1024", "filename": "icon_1024.png"]],
+                                     "info": ["author": "xcode", "version": 1]]
+try JSONSerialization.data(withJSONObject: mobileContents, options: [.prettyPrinted, .sortedKeys]).write(to: mobile.appendingPathComponent("Contents.json"))
+try #"{"info":{"author":"xcode","version":1}}"#.write(to: mobile.deletingLastPathComponent().appendingPathComponent("Contents.json"), atomically: true, encoding: .utf8)
+print("wrote the iOS icon to \(mobile.path)")

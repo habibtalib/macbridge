@@ -576,6 +576,11 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
+    #if os(iOS)
+    /// The newest text copied on the Mac during this session, for "Get Mac's clipboard".
+    public var hostClipboardText: String? { controllerClipboard?.latestRemote }
+    #endif
+
     /// Presses a shortcut on the host that this Mac's keyboard cannot send, because macOS acts on it here first.
     public func sendShortcut(_ shortcut: RemoteShortcut) {
         for message in shortcut.messages { controllerSession?.send(message) }

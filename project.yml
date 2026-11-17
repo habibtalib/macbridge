@@ -46,7 +46,42 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
         ARCHS: arm64
+  MacBridgeMobile:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - Mobile
+    dependencies:
+      - package: BridgeCore
+    info:
+      path: Mobile/Info.plist
+      properties:
+        CFBundleDisplayName: MacBridge
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UIApplicationSupportsIndirectInputEvents: true
+        # Same reason as on the Mac: the server may be a plain ws:// address on a private network.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: MacBridge connects straight to your Mac when both are on the same network.
+        NSCameraUsageDescription: MacBridge uses the camera to scan the pairing code shown on your Mac.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.habibtalib.macbridge.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
 schemes:
+  MacBridgeMobile:
+    build:
+      targets:
+        MacBridgeMobile: all
+    run:
+      config: Debug
   MacBridge:
     build:
       targets:

@@ -1,4 +1,5 @@
 import BridgeCore
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 /// This Mac: its address, whether it is online, and whether it can be controlled.
@@ -116,7 +117,12 @@ struct ThisMacPanel: View {
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .textSelection(.enabled)
                     .lineLimit(1).minimumScaleFactor(0.7)
-                Text("Type it on the other Mac. Whoever has it can control this Mac. Works once, expires \(expires, style: .relative).")
+                if let qr = Self.qrCode(code) {
+                    Image(nsImage: qr).interpolation(.none).resizable().frame(width: 120, height: 120)
+                        .padding(6).background(Color.white, in: RoundedRectangle(cornerRadius: 6))
+                        .accessibilityLabel("Pairing code as a QR code, for MacBridge on iPhone or iPad")
+                }
+                Text("Type it on the other Mac, or scan it with MacBridge on an iPhone or iPad. Whoever has it can control this Mac. Works once, expires \(expires, style: .relative).")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Hide code") { model.cancelPairing() }.controlSize(.small)
@@ -129,5 +135,17 @@ struct ThisMacPanel: View {
                 .disabled(!isOnline)
                 .help("Lets another Mac add this one, so it can control it")
         }
+    }
+
+    /// The pairing code as a QR code.
+    static func qrCode(_ text: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(text.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage else { return nil }
+        let rep = NSCIImageRep(ciImage: output)
+        let image = NSImage(size: rep.size)
+        image.addRepresentation(rep)
+        return image
     }
 }
