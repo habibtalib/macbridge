@@ -173,7 +173,7 @@ private struct DeviceGrid: View {
             EmptyDevices()
         } else {
             ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 240), spacing: 18)], alignment: .leading, spacing: 18) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
                     ForEach(devices) { device in
                         DeviceTile(device: device)
                     }
@@ -224,14 +224,14 @@ private struct DeviceTile: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         PresenceDot(online: model.presence[device.id])
-                        Text(model.displayName(device)).font(.headline).lineLimit(1)
+                        Text(model.displayName(device)).font(.title3.weight(.semibold)).lineLimit(1)
                         Spacer(minLength: 0)
                         if meta.isFavourite { Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow) }
                     }
-                    Text(DeviceID.grouped(device.id)).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
-                    Text(lastUsed).font(.caption).foregroundStyle(.tertiary)
+                    Text(DeviceID.grouped(device.id)).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                    Text(lastUsed).font(.callout).foregroundStyle(.tertiary)
                 }
-                .padding(10)
+                .padding(14)
             }
             .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -277,7 +277,7 @@ private struct DeviceTile: View {
                     ZStack {
                         LinearGradient(colors: [Color.accentColor.opacity(0.35), Color.accentColor.opacity(0.12)],
                                        startPoint: .topLeading, endPoint: .bottomTrailing)
-                        Image(systemName: "desktopcomputer").font(.system(size: 34, weight: .light)).foregroundStyle(.white.opacity(0.9))
+                        Image(systemName: "desktopcomputer").font(.system(size: 48, weight: .light)).foregroundStyle(.white.opacity(0.9))
                     }
                 }
             }

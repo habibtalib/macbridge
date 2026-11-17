@@ -14,7 +14,7 @@ struct MacBridgeApp: App {
                 KeychainErrorView()
             }
         }
-        .defaultSize(width: 860, height: 560)
+        .defaultSize(width: 960, height: 620)
         .commands {
             // The remote screen takes ⌘ shortcuts while it has focus, so the
             // local "New Window" item would only get in the way.
