@@ -1,5 +1,7 @@
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 import Combine
 import CoreGraphics
@@ -999,7 +1001,10 @@ public final class BridgeModel: ObservableObject {
         #if os(macOS)
         return Host.current().localizedName
         #else
-        return ProcessInfo.processInfo.hostName
+        // Not ProcessInfo.hostName: on iOS it waits on a network name lookup, and at launch
+        // that blocks the main thread until iOS kills the app.
+        guard Thread.isMainThread else { return nil }
+        return MainActor.assumeIsolated { UIDevice.current.name }
         #endif
     }
 
