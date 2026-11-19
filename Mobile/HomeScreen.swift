@@ -52,10 +52,10 @@ struct HomeScreen: View {
             }
             .sheet(isPresented: $showsSettings) { SettingsScreen() }
             .sheet(isPresented: $showsScanner) {
-                CodeScanner { code in
+                CodeScanner { link in
                     showsScanner = false
-                    query = code
-                    model.pair(usingCode: code)
+                    query = link.code
+                    model.pair(using: link)
                 }
                 .ignoresSafeArea()
             }
@@ -122,7 +122,6 @@ struct HomeScreen: View {
                 } else if DataScannerViewController.isSupported {
                     Button { showsScanner = true } label: { Image(systemName: "qrcode.viewfinder").font(.title3) }
                         .buttonStyle(.bordered)
-                        .disabled(!isOnline)
                         .accessibilityLabel("Scan the pairing code on your Mac")
                 }
             }
@@ -242,7 +241,7 @@ private struct DeviceCard: View {
 
 /// Camera view that reads the QR code a Mac shows under "Show pairing code".
 private struct CodeScanner: UIViewControllerRepresentable {
-    let found: (String) -> Void
+    let found: (PairingLink) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(found: found) }
 
@@ -257,18 +256,18 @@ private struct CodeScanner: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: DataScannerViewController, context: Context) {}
 
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
-        let found: (String) -> Void
+        let found: (PairingLink) -> Void
         private var done = false
-        init(found: @escaping (String) -> Void) { self.found = found }
+        init(found: @escaping (PairingLink) -> Void) { self.found = found }
 
         func dataScanner(_ scanner: DataScannerViewController, didAdd added: [RecognizedItem], allItems: [RecognizedItem]) {
             guard !done else { return }
             for case let .barcode(code) in added {
-                // Only a MacBridge pairing code counts; any other QR code is ignored.
-                guard let text = code.payloadStringValue, PairingCode(text) != nil else { continue }
+                // Only a MacBridge pairing code or link counts; any other QR code is ignored.
+                guard let text = code.payloadStringValue, let link = PairingLink(text) else { continue }
                 done = true
                 scanner.stopScanning()
-                found(text)
+                found(link)
                 return
             }
         }

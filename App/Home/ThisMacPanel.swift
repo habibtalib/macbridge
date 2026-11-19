@@ -117,7 +117,7 @@ struct ThisMacPanel: View {
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .textSelection(.enabled)
                     .lineLimit(1).minimumScaleFactor(0.7)
-                if let qr = Self.qrCode(code) {
+                if let qr = Self.qrCode(PairingLink(code: code, server: model.serverURL).url?.absoluteString ?? code) {
                     Image(nsImage: qr).interpolation(.none).resizable().frame(width: 120, height: 120)
                         .padding(6).background(Color.white, in: RoundedRectangle(cornerRadius: 6))
                         .accessibilityLabel("Pairing code as a QR code, for MacBridge on iPhone or iPad")

@@ -71,8 +71,16 @@ public final class BridgeModel: ObservableObject {
     /// Which paired devices are connected to the server right now. A device missing here is unknown.
     @Published public private(set) var presence: [String: Bool] = [:]
     @Published public private(set) var signalingStatus: SignalingClient.Status = .offline {
-        didSet { updatePower() }
+        didSet {
+            updatePower()
+            if signalingStatus == .online, let code = codeAwaitingServer {
+                codeAwaitingServer = nil
+                pair(usingCode: code)
+            }
+        }
     }
+    /// A scanned pairing code kept until the server it came with answers.
+    private var codeAwaitingServer: String?
     /// Who controlled this Mac and when, newest first.
     @Published public private(set) var sessionLog: [SessionLogEntry] = []
     @Published public private(set) var controllerStatus: ControllerStatus = .idle
@@ -378,6 +386,30 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
+    /// Pairs from a scanned or opened pairing link. With no server set yet, or offline,
+    /// it takes the link's server, goes online and pairs once the server answers.
+    public func pair(using link: PairingLink) {
+        if let server = link.server, Self.parseServerURL(server) != parsedServerURL {
+            serverURL = server
+            goOnline()
+        } else if signalingStatus == .offline, canGoOnline {
+            goOnline()
+        }
+        guard canGoOnline else {
+            pairingStatus = .failed("Set the server in Settings first, then scan again.")
+            return
+        }
+        if signalingStatus == .online { return pair(usingCode: link.code) }
+        codeAwaitingServer = link.code
+        pairingStatus = .waiting
+        pairingTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled, let self, self.codeAwaitingServer != nil else { return }
+            self.cancelPairing()
+            self.pairingStatus = .failed("Can't reach the server. If it is on a Tailscale network, turn Tailscale on.")
+        }
+    }
+
     /// Sends a code typed on this Mac to the Mac that is showing it.
     public func pair(usingCode text: String) {
         guard signalingStatus == .online else { return }
@@ -404,6 +436,7 @@ public final class BridgeModel: ObservableObject {
         if shownCode != nil { signaling?.closePairing() }
         shownCode = nil
         typedCode = nil
+        codeAwaitingServer = nil
         pairingStatus = .idle
     }
 

@@ -9,6 +9,10 @@ struct MacBridgeMobileApp: App {
         WindowGroup {
             if let model = launch.model {
                 RootScreen().environmentObject(model)
+                    // The Mac's pairing QR code read with the Camera app.
+                    .onOpenURL { url in
+                        if let link = PairingLink(url.absoluteString) { model.pair(using: link) }
+                    }
             } else {
                 ContentUnavailableView("MacBridge could not read its key",
                                        systemImage: "key.slash",
