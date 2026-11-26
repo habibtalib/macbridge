@@ -91,6 +91,7 @@ private struct ConnectBar: View {
                         Button { query = ""; model.cancelPairing() } label: { Image(systemName: "xmark.circle.fill") }
                             .buttonStyle(.plain).foregroundStyle(.secondary)
                             .help("Clear")
+                            .accessibilityLabel("Clear")
                     }
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
@@ -176,6 +177,14 @@ private struct DeviceGrid: View {
     @EnvironmentObject private var model: BridgeModel
     let query: String
     @State private var filter: DeviceFilter = .all
+    /// Tile order, by device ID. Worked out again when the filter, the search or the paired Macs
+    /// change, not on every presence answer: a tile must not move away from under the pointer.
+    @State private var order: [String] = []
+    // Kept here, not in the tile: a tile can leave the grid (its Mac went offline under the
+    // Online filter) while its question is open.
+    @State private var renaming: PairedDevice?
+    @State private var forgetting: PairedDevice?
+    @State private var newName = ""
 
     private var filteredByQuery: [PairedDevice] {
         ConnectInput.filter(model.controllableSorted, query, names: model.displayNames)
@@ -189,73 +198,116 @@ private struct DeviceGrid: View {
         model.controllable.filter { model.meta[$0.id]?.isFavourite == true }.count
     }
 
-    private var devices: [PairedDevice] {
-        let base: [PairedDevice]
+    private var matching: [PairedDevice] {
         switch filter {
-        case .all: base = filteredByQuery
-        case .online: base = filteredByQuery.filter { model.presence[$0.id] == true }
-        case .favourites: base = filteredByQuery.filter { model.meta[$0.id]?.isFavourite == true }
-        }
-        // Keep favourites first, then online Macs before offline ones.
-        return base.sorted { a, b in
-            let fa = model.meta[a.id]?.isFavourite == true
-            let fb = model.meta[b.id]?.isFavourite == true
-            if fa != fb { return fa }
-            let oa = model.presence[a.id] == true
-            let ob = model.presence[b.id] == true
-            if oa != ob { return oa }
-            return false
+        case .all: return filteredByQuery
+        case .online: return filteredByQuery.filter { model.presence[$0.id] == true }
+        case .favourites: return filteredByQuery.filter { model.meta[$0.id]?.isFavourite == true }
         }
     }
 
-    var body: some View {
-        if model.controllable.isEmpty {
-            EmptyDevices()
-        } else {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    ForEach(DeviceFilter.allCases) { f in
-                        let count = f == .all ? model.controllable.count : f == .online ? onlineCount : favouriteCount
-                        Button { filter = f } label: {
-                            HStack(spacing: 4) {
-                                if f == .online {
-                                    Circle().fill(count > 0 ? Color.green : Color.secondary.opacity(0.4)).frame(width: 6, height: 6)
-                                } else if f == .favourites {
-                                    Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(filter == f ? .white : .yellow)
-                                }
-                                Text("\(f.title) (\(count))").font(.callout.weight(filter == f ? .semibold : .regular)).monospacedDigit()
-                            }
-                            .padding(.horizontal, 10).padding(.vertical, 4)
-                            .background(filter == f ? Color.accentColor : Color.primary.opacity(0.06), in: Capsule())
-                            .foregroundStyle(filter == f ? .white : .primary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    Spacer()
-                    Button { model.refreshPresence() } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise").font(.callout)
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .disabled(model.signalingStatus != .online)
-                    .help("Refresh which Macs are online")
-                }
+    /// The matching Macs in the order last worked out; any that joined since go last.
+    private var devices: [PairedDevice] {
+        let rank = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return matching.enumerated()
+            .sorted { (rank[$0.element.id] ?? order.count, $0.offset) < (rank[$1.element.id] ?? order.count, $1.offset) }
+            .map(\.element)
+    }
 
-                if devices.isEmpty {
-                    Text(filter == .online ? "No paired Macs are online right now."
-                         : filter == .favourites ? "No favourite Macs yet. Click the star on a tile to pin it."
-                         : "No paired Mac matches your search.")
-                        .font(.callout).foregroundStyle(.secondary)
-                        .padding(.top, 8)
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
-                            ForEach(devices) { device in
-                                DeviceTile(device: device)
+    /// Favourites first, then online Macs before offline ones.
+    private func resort() {
+        order = matching.enumerated().sorted { a, b in
+            let fa = model.meta[a.element.id]?.isFavourite == true
+            let fb = model.meta[b.element.id]?.isFavourite == true
+            if fa != fb { return fa }
+            let oa = model.presence[a.element.id] == true
+            let ob = model.presence[b.element.id] == true
+            if oa != ob { return oa }
+            return a.offset < b.offset
+        }.map(\.element.id)
+    }
+
+    var body: some View {
+        Group {
+            if model.controllable.isEmpty {
+                EmptyDevices()
+            } else {
+                grid
+            }
+        }
+        .onAppear(perform: resort)
+        .onChange(of: filter) { _, _ in resort() }
+        .onChange(of: query) { _, _ in resort() }
+        .onChange(of: model.controllable.map(\.id)) { _, _ in resort() }
+        // The first answer after none at all: online Macs move up once.
+        .onChange(of: model.presence.isEmpty) { _, _ in resort() }
+        .alert("Rename \(renaming?.name ?? "")", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
+               presenting: renaming) { device in
+            TextField("Name", text: $newName)
+            Button("Save") { model.rename(device, to: newName) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("The name is used on this Mac only. Leave it empty to use the Mac's own name.")
+        }
+        .alert(forgetting.map { "Forget \(model.displayName($0))?" } ?? "",
+               isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
+               presenting: forgetting) { device in
+            Button("Forget", role: .destructive) { model.forget(device) }
+            Button("Cancel", role: .cancel) {}
+        } message: { device in
+            Text("You'll need a new pairing code from \(model.displayName(device)) to control it again.")
+        }
+    }
+
+    private var grid: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                ForEach(DeviceFilter.allCases) { f in
+                    let count = f == .all ? model.controllable.count : f == .online ? onlineCount : favouriteCount
+                    Button { filter = f } label: {
+                        HStack(spacing: 4) {
+                            if f == .online {
+                                Circle().fill(count > 0 ? Color.green : Color.secondary.opacity(0.4)).frame(width: 6, height: 6)
+                            } else if f == .favourites {
+                                Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(filter == f ? .white : .yellow)
                             }
+                            Text("\(f.title) (\(count))").font(.callout.weight(filter == f ? .semibold : .regular)).monospacedDigit()
                         }
-                        .padding(.vertical, 2)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(filter == f ? Color.accentColor : Color.primary.opacity(0.06), in: Capsule())
+                        .foregroundStyle(filter == f ? .white : .primary)
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(f.title), \(count)")
+                    .accessibilityAddTraits(filter == f ? .isSelected : [])
+                }
+                Spacer()
+                Button { model.refreshPresence() } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise").font(.callout)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .disabled(model.signalingStatus != .online)
+                .help("Refresh which Macs are online")
+            }
+
+            let devices = devices
+            if devices.isEmpty {
+                Text(filter == .online ? "No paired Macs are online right now."
+                     : filter == .favourites ? "No favourite Macs yet. Click the star on a tile to pin it."
+                     : "No paired Mac matches your search.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .padding(.top, 8)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
+                        ForEach(devices) { device in
+                            DeviceTile(device: device,
+                                       rename: { newName = model.displayName(device); renaming = device },
+                                       forget: { forgetting = device })
+                        }
+                    }
+                    .padding(.vertical, 2)
                 }
             }
         }
@@ -287,10 +339,10 @@ private struct EmptyDevices: View {
 private struct DeviceTile: View {
     @EnvironmentObject private var model: BridgeModel
     let device: PairedDevice
+    let rename: () -> Void
+    let forget: () -> Void
     @State private var hovering = false
-    @State private var renaming = false
-    @State private var confirmingForget = false
-    @State private var newName = ""
+    @State private var thumbnail: NSImage?
 
     private var meta: DeviceMeta { model.meta[device.id] ?? DeviceMeta() }
     private var isCalling: Bool { model.controllerStatus == .calling(device) }
@@ -298,6 +350,32 @@ private struct DeviceTile: View {
     private var isOnline: Bool? { model.presence[device.id] }
 
     var body: some View {
+        // The star is a control of its own, beside the tile's button rather than inside it.
+        ZStack(alignment: .topTrailing) {
+            tileButton
+            if hovering || meta.isFavourite {
+                Button { model.setFavourite(device, !meta.isFavourite) } label: {
+                    Image(systemName: meta.isFavourite ? "star.fill" : "star")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(meta.isFavourite ? .yellow : .white)
+                        .padding(6)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(8)
+                .help(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites")
+                .accessibilityLabel(meta.isFavourite ? "Remove \(model.displayName(device)) from Favourites" : "Add \(model.displayName(device)) to Favourites")
+            }
+        }
+        .onHover { hovering = $0 }
+        .task(id: device.id) { thumbnail = Thumbnails.image(for: device.id) }
+        // A session that just ended may save its picture after this appeared.
+        .onReceive(NotificationCenter.default.publisher(for: Thumbnails.changed)) { note in
+            if note.object as? String == device.id { thumbnail = Thumbnails.image(for: device.id) }
+        }
+    }
+
+    private var tileButton: some View {
         Button(action: { if isCalling { model.disconnect() } else { model.connect(to: device) } }) {
             VStack(alignment: .leading, spacing: 0) {
                 preview
@@ -306,7 +384,10 @@ private struct DeviceTile: View {
                         PresenceDot(online: isOnline)
                         Text(model.displayName(device)).font(.title3.weight(.semibold)).lineLimit(1)
                         Spacer(minLength: 0)
-                        if meta.isFavourite { Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow) }
+                        if meta.isFavourite {
+                            Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
+                                .accessibilityLabel("Favourite")
+                        }
                     }
                     Text(DeviceID.grouped(device.id)).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                     Text(lastUsed).font(.callout).foregroundStyle(.tertiary)
@@ -322,32 +403,19 @@ private struct DeviceTile: View {
         .buttonStyle(.plain)
         .disabled(!canConnect && !isCalling)
         .opacity(canConnect || isCalling ? (isOnline == false ? 0.78 : 1) : 0.6)
-        .onHover { hovering = $0 }
         .help(canConnect ? "Connect to \(model.displayName(device))" : "This Mac is offline")
+        .accessibilityHint(isCalling ? "Cancels connecting" : "Connects to this Mac")
         .contextMenu {
             Button("Connect") { model.connect(to: device) }.disabled(!canConnect)
             Divider()
-            Button("Rename…") { newName = model.displayName(device); renaming = true }
+            Button("Rename…", action: rename)
             Button(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites") { model.setFavourite(device, !meta.isFavourite) }
             Button("Copy Address") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(DeviceID.grouped(device.id), forType: .string)
             }
             Divider()
-            Button("Forget \(model.displayName(device))…", role: .destructive) { confirmingForget = true }
-        }
-        .alert("Rename \(device.name)", isPresented: $renaming) {
-            TextField("Name", text: $newName)
-            Button("Save") { model.rename(device, to: newName) }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The name is used on this Mac only. Leave it empty to use the Mac's own name.")
-        }
-        .alert("Forget \(model.displayName(device))?", isPresented: $confirmingForget) {
-            Button("Forget", role: .destructive) { model.forget(device) }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("You'll need a new pairing code from \(model.displayName(device)) to control it again.")
+            Button("Forget \(model.displayName(device))…", role: .destructive, action: forget)
         }
     }
 
@@ -357,14 +425,16 @@ private struct DeviceTile: View {
             .aspectRatio(16 / 10, contentMode: .fit)
             .frame(maxWidth: .infinity)
             .overlay {
-                if let image = Thumbnails.image(for: device.id) {
-                    Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+                if let thumbnail {
+                    Image(nsImage: thumbnail).resizable().aspectRatio(contentMode: .fill)
+                        .accessibilityHidden(true)
                 } else {
                     ZStack {
                         LinearGradient(colors: [Color.accentColor.opacity(0.35), Color.accentColor.opacity(0.12)],
                                        startPoint: .topLeading, endPoint: .bottomTrailing)
                         Image(systemName: "desktopcomputer").font(.system(size: 48, weight: .light)).foregroundStyle(.white.opacity(0.9))
                     }
+                    .accessibilityHidden(true)
                 }
             }
             .overlay(alignment: .topLeading) {
@@ -376,20 +446,7 @@ private struct DeviceTile: View {
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(8)
-                }
-            }
-            .overlay(alignment: .topTrailing) {
-                if hovering || meta.isFavourite {
-                    Button { model.setFavourite(device, !meta.isFavourite) } label: {
-                        Image(systemName: meta.isFavourite ? "star.fill" : "star")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(meta.isFavourite ? .yellow : .white)
-                            .padding(6)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(8)
-                    .help(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites")
+                    .accessibilityHidden(true) // the dot by the name says it
                 }
             }
             .overlay {
@@ -410,6 +467,7 @@ private struct DeviceTile: View {
                             .background(.ultraThinMaterial, in: Capsule())
                     }
                     .transition(.opacity)
+                    .accessibilityHidden(true)
                 }
             }
             .clipped()
@@ -437,18 +495,35 @@ struct PresenceDot: View {
 /// Pictures of each Mac's screen from the last session (filled in by the session window).
 enum Thumbnails {
     static var folder: URL {
+        // A layout snapshot must leave the real pictures alone.
+        if ProcessInfo.processInfo.environment["MACBRIDGE_SNAPSHOT"] != nil {
+            return FileManager.default.temporaryDirectory.appendingPathComponent("MacBridge-snapshot-thumbnails", isDirectory: true)
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("MacBridge/Thumbnails", isDirectory: true)
     }
 
     static func url(for deviceID: String) -> URL { folder.appendingPathComponent("\(deviceID).jpg") }
 
-    static func image(for deviceID: String) -> NSImage? { NSImage(contentsOf: url(for: deviceID)) }
+    /// Read from disk once per picture, not on every redraw of a tile.
+    @MainActor private static var cache: [String: NSImage?] = [:]
+
+    @MainActor static func image(for deviceID: String) -> NSImage? {
+        if let cached = cache[deviceID] { return cached }
+        let image = NSImage(contentsOf: url(for: deviceID))
+        cache[deviceID] = .some(image)
+        return image
+    }
 
     /// Keeps the last picture of a session as the Mac's tile picture.
     @MainActor static func save(from video: RemoteVideo, for deviceID: String?) {
         guard let deviceID, let data = video.thumbnailJPEG() else { return }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try? data.write(to: url(for: deviceID), options: .atomic)
+        cache[deviceID] = nil
+        NotificationCenter.default.post(name: changed, object: deviceID)
     }
+
+    /// Posted with the device ID as object when its picture was replaced.
+    static let changed = Notification.Name("MacBridge.thumbnailChanged")
 }

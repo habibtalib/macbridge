@@ -14,22 +14,28 @@ final class HostPanels {
 
     init(model: BridgeModel) {
         self.model = model
-        model.$hostStatus.combineLatest(model.$hostSince)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] status, since in self?.showSession(status, since: since) }
+        // DispatchQueue, not RunLoop: the run loop's default mode waits while a menu is open.
+        model.$hostStatus.combineLatest(model.$hostSince, model.$hostDisplay.map { $0?.id }.removeDuplicates())
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status, since, display in self?.showSession(status, since: since, on: display) }
             .store(in: &subscriptions)
         model.$pendingRequest
-            .receive(on: RunLoop.main)
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] request in self?.showAsk(request) }
             .store(in: &subscriptions)
     }
 
-    private func showSession(_ status: BridgeModel.HostStatus, since: Date?) {
+    /// On the display being shown, so whoever is in control sees it too.
+    private func showSession(_ status: BridgeModel.HostStatus, since: Date?, on display: CGDirectDisplayID?) {
         sessionPanel?.close()
         sessionPanel = nil
         guard case let .sharing(peer) = status else { return }
         let view = HostPanelView(name: model.displayName(peer), started: since ?? Date()) { [weak model] in model?.endHostSession() }
-        sessionPanel = Self.panel(view, size: CGSize(width: 320, height: 76), corner: .topRight)
+        sessionPanel = Self.panel(view, size: CGSize(width: 320, height: 76), corner: .topRight, on: display.flatMap(Self.screen))
+    }
+
+    private static func screen(_ id: CGDirectDisplayID) -> NSScreen? {
+        NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }
     }
 
     private func showAsk(_ request: BridgeModel.PendingRequest?) {
@@ -45,7 +51,7 @@ final class HostPanels {
 
     private enum Corner { case topRight, center }
 
-    private static func panel(_ view: some View, size: CGSize, corner: Corner) -> NSPanel {
+    private static func panel(_ view: some View, size: CGSize, corner: Corner, on screen: NSScreen? = nil) -> NSPanel {
         // Non-activating: it must not take the keyboard from what the person at this Mac is doing.
         let panel = NSPanel(contentRect: CGRect(origin: .zero, size: size),
                             styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless], backing: .buffered, defer: false)
@@ -59,7 +65,7 @@ final class HostPanels {
         panel.hasShadow = true
         panel.isReleasedWhenClosed = false
         panel.contentView = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
-        if let screen = NSScreen.main?.visibleFrame {
+        if let screen = (screen ?? NSScreen.main)?.visibleFrame {
             switch corner {
             case .topRight:
                 panel.setFrameOrigin(CGPoint(x: screen.maxX - size.width - 16, y: screen.maxY - size.height - 16))

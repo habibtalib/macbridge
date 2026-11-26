@@ -301,6 +301,66 @@ struct BridgeModelTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func theSavedQualityIsAskedForOnceTheChannelsOpen() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (laptop, studioID, standIn, received) = try await laptopCallingAStandIn(server)
+        defer { laptop.goOffline(); standIn.disconnect() }
+        laptop.preferredQuality = .light
+        let studio = try #require(laptop.controllable.first)
+
+        // The stand-in answers as a host would: a host session wired through the server.
+        let host = try #require(PeerSession(role: .host))
+        defer { host.close() }
+        let laptopID = laptop.deviceID
+        host.onSignal = { payload in
+            standIn.send(SignalEnvelope(payload, auth: SessionAuth.sign(payload, to: laptopID, identity: studioID)), to: laptopID)
+        }
+        host.onInput = { message in DispatchQueue.main.async { received.input.append(message) } }
+        standIn.onSignal = { _, envelope in
+            received.payloads.append(envelope.payload)
+            switch envelope.payload {
+            case .request: host.start()
+            case .answer, .candidate: host.handle(envelope.payload)
+            default: break
+            }
+        }
+
+        laptop.connect(to: studio)
+        try await poll("quality asked for") { received.input.contains(.quality(.light)) }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(received.input.filter { if case .quality = $0 { true } else { false } } == [.quality(.light)])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aCallMadeWhileReconnectingWaitsForTheServer() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        let studioAtLaptop = try #require(laptop.controllable.first)
+
+        // Back from the background: the connection is being made again.
+        laptop.goOnline()
+        #expect(laptop.signalingStatus != .online)
+        laptop.connect(to: studioAtLaptop)
+        #expect(laptop.controllerStatus == .idle)
+        // Studio does not allow control, so the call may already have been turned away.
+        try await poll("calls once online") { laptop.controllerStatus != .idle }
+        #expect(laptop.lastHost == studioAtLaptop)
+        laptop.disconnect()
+        laptop.dismissFailure()
+
+        // Disconnect drops a call still waiting.
+        laptop.goOnline()
+        laptop.connect(to: studioAtLaptop)
+        laptop.disconnect()
+        try await poll("online again") { laptop.signalingStatus == .online }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(laptop.controllerStatus == .idle)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aRefusalSaysWhy() async throws {
         let server = try await LocalServer.start()
         defer { server.stop() }
@@ -550,6 +610,19 @@ struct BridgeModelTests {
         #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory()).paired.isEmpty)
     }
 
+    @Test func theQualityPresetSurvivesARestart() throws {
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory()).preferredQuality == .sharp)
+        // The key and the Int the views wrote before the model kept it.
+        defaults.set(Int(QualityPreset.balanced.rawValue), forKey: "qualityPreset")
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory())
+        #expect(model.preferredQuality == .balanced)
+        model.preferredQuality = .light
+        #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory()).preferredQuality == .light)
+    }
+
     @Test func namesFromOtherDevicesAreMadeSafeToShow() {
         #expect(BridgeModel.label("  Studio\n", id: "abcdefgh") == "Studio")
         #expect(BridgeModel.label("", id: "abcdefgh") == "Mac abcd")
@@ -563,4 +636,5 @@ private final class Received: @unchecked Sendable {
     var online = false
     var payloads: [SignalPayload] = []
     var reasons: [ByeReason?] = []
+    var input: [InputMessage] = []
 }

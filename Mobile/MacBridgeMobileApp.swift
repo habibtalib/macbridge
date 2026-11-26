@@ -41,7 +41,6 @@ struct RootScreen: View {
     /// A session that iOS ended by putting the app in the background.
     @State private var interrupted: PairedDevice?
 
-
     var body: some View {
         Group {
             switch model.controllerStatus {
@@ -51,7 +50,9 @@ struct RootScreen: View {
                 if let video = model.remoteVideo {
                     SessionScreen(video: video, host: host)
                 } else {
+                    // A new host starts a new timer.
                     ConnectingScreen(name: model.displayName(host)) { model.disconnect() }
+                        .id(host.id)
                 }
             case let .failed(reason):
                 DroppedScreen(name: model.lastHost.map(model.displayName), reason: reason,
@@ -62,10 +63,14 @@ struct RootScreen: View {
         .onChange(of: phase) { _, new in
             switch new {
             case .background:
-                // iOS stops the app in the background; end the session cleanly instead of letting it hang.
-                if case let .connected(host) = model.controllerStatus {
+                // iOS stops the app in the background; end the session, or the call still
+                // being made, cleanly instead of letting it hang.
+                switch model.controllerStatus {
+                case let .connected(host), let .calling(host):
                     interrupted = host
                     model.disconnect()
+                case .idle, .failed:
+                    break
                 }
             case .active:
                 // A socket left in the background is often dead: check it, or reconnect without backoff.
@@ -75,8 +80,17 @@ struct RootScreen: View {
                 break
             }
         }
+        // The screen stays on while a Mac is being controlled: nobody touches this one meanwhile.
+        .onChange(of: model.controllerStatus, initial: true) { _, status in
+            switch status {
+            case .calling, .connected: UIApplication.shared.isIdleTimerDisabled = true
+            case .idle, .failed: UIApplication.shared.isIdleTimerDisabled = false
+            }
+        }
         .alert("Session ended", isPresented: Binding(get: { interrupted != nil && phase == .active }, set: { if !$0 { interrupted = nil } })) {
             Button("Reconnect") {
+                // Back from the background the server connection may still be coming back:
+                // the call waits for it.
                 if let host = interrupted { model.connect(to: host) }
                 interrupted = nil
             }
@@ -146,13 +160,26 @@ enum Thumbnails {
 
     static func url(for deviceID: String) -> URL { folder.appendingPathComponent("\(deviceID).jpg") }
 
-    static func image(for deviceID: String) -> UIImage? { UIImage(contentsOfFile: url(for: deviceID).path) }
+    /// Read from disk once per picture, not on every redraw of a card.
+    @MainActor private static var cache: [String: UIImage?] = [:]
+
+    @MainActor static func image(for deviceID: String) -> UIImage? {
+        if let cached = cache[deviceID] { return cached }
+        let image = UIImage(contentsOfFile: url(for: deviceID).path)
+        cache[deviceID] = .some(image)
+        return image
+    }
 
     @MainActor static func save(from video: RemoteVideo, for deviceID: String?) {
         guard let deviceID, let data = video.thumbnailJPEG() else { return }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try? data.write(to: url(for: deviceID), options: .atomic)
+        cache[deviceID] = nil
+        NotificationCenter.default.post(name: changed, object: deviceID)
     }
+
+    /// Posted with the device ID as object when its picture was replaced.
+    static let changed = Notification.Name("MacBridge.thumbnailChanged")
 }
 
 /// The question to ask while a pairing link waits for a yes to use its server.

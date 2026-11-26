@@ -59,6 +59,10 @@ public final class BridgeModel: ObservableObject {
     private var switchingByLink = false
     @Published public var deviceName: String { didSet { defaults.set(deviceName, forKey: Keys.deviceName) } }
     @Published public var forcesRelay: Bool { didSet { defaults.set(forcesRelay, forKey: Keys.forcesRelay) } }
+    /// The quality each session starts with, asked of the host once the input channels open.
+    @Published public var preferredQuality: QualityPreset {
+        didSet { defaults.set(Int(preferredQuality.rawValue), forKey: Keys.qualityPreset) }
+    }
     @Published public var allowsControl: Bool {
         didSet {
             defaults.set(allowsControl, forKey: Keys.allowsControl)
@@ -93,8 +97,15 @@ public final class BridgeModel: ObservableObject {
                 codeAwaitingServer = nil
                 pair(usingCode: code)
             }
+            if signalingStatus == .online, let host = hostAwaitingServer {
+                connect(to: host)
+            }
         }
     }
+    /// A Mac to connect to once the server answers: asked for while the connection was still
+    /// coming back (an iPhone back from the background, a Mac back from sleep).
+    private var hostAwaitingServer: PairedDevice?
+    private var hostAwaitingTimeout: Task<Void, Never>?
     /// A scanned pairing code kept until the server it came with answers.
     private var codeAwaitingServer: String?
     /// A pairing link for another server, kept until the switch is confirmed or cancelled.
@@ -142,7 +153,8 @@ public final class BridgeModel: ObservableObject {
     let power = PowerAssertions()
     private let lidKeeper: LidClosedKeeper
     private var lidTimer: Task<Void, Never>?
-    private var hostDisplay: DisplayInfo?
+    /// The display shown to the Mac in control, while a session runs.
+    @Published public private(set) var hostDisplay: DisplayInfo?
     /// Created for a session when this Mac has no usable screen (lid closed,
     /// no monitor); removed when the session ends.
     private var virtualDisplay: VirtualDisplay?
@@ -173,6 +185,8 @@ public final class BridgeModel: ObservableObject {
         accessToken = secrets.token(key)
         deviceName = defaults.string(forKey: Keys.deviceName) ?? Self.defaultDeviceName()
         forcesRelay = defaults.bool(forKey: Keys.forcesRelay)
+        preferredQuality = (defaults.object(forKey: Keys.qualityPreset) as? Int)
+            .flatMap { UInt8(exactly: $0) }.flatMap(QualityPreset.init) ?? .sharp
         allowsControl = defaults.bool(forKey: Keys.allowsControl)
         paired = defaults.data(forKey: Keys.paired)
             .flatMap { try? JSONDecoder().decode([PairedDevice].self, from: $0) } ?? []
@@ -254,6 +268,8 @@ public final class BridgeModel: ObservableObject {
     }
 
     public var parsedServerURL: URL? { Self.parseServerURL(serverURL) }
+    /// The server the current connection uses. Until going online again, the one in Settings may differ.
+    public var connectedServerURL: URL? { signaling?.url }
     public var canGoOnline: Bool { parsedServerURL != nil }
     /// Devices this Mac can control.
     public var controllable: [PairedDevice] { paired.filter(\.thisMacMayControl) }
@@ -354,6 +370,7 @@ public final class BridgeModel: ObservableObject {
     }
 
     public func goOffline() {
+        cancelWaitingConnect()
         disconnect()
         endHosting(notify: true)
         cancelPairing()
@@ -678,8 +695,12 @@ public final class BridgeModel: ObservableObject {
 
     // MARK: - Controlling another Mac
 
+    /// Calls a paired Mac. While the server connection is still coming back, the call waits
+    /// until it is online.
     public func connect(to host: PairedDevice) {
-        guard signalingStatus == .online, let host = controllable.first(where: { $0.id == host.id }) else { return }
+        guard let host = controllable.first(where: { $0.id == host.id }) else { return }
+        guard signalingStatus == .online else { return connectOnceOnline(host) }
+        cancelWaitingConnect()
         disconnect()
         controllerPeer = host
         lastHost = host
@@ -696,6 +717,27 @@ public final class BridgeModel: ObservableObject {
             guard controllerPeer == host, controllerSession == nil else { return } // cancelled meanwhile
             startControlling(host, iceServers: servers)
         }
+    }
+
+    private func connectOnceOnline(_ host: PairedDevice) {
+        if signaling == nil {
+            guard canGoOnline else { return }
+            goOnline()
+        }
+        cancelWaitingConnect()
+        hostAwaitingServer = host
+        hostAwaitingTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled, let self, self.hostAwaitingServer != nil else { return }
+            self.cancelWaitingConnect()
+            self.notice = "Could not connect to \(self.displayName(host)): the server did not answer."
+        }
+    }
+
+    private func cancelWaitingConnect() {
+        hostAwaitingTimeout?.cancel()
+        hostAwaitingTimeout = nil
+        hostAwaitingServer = nil
     }
 
     /// A call the host has not answered by then fails. Internal so tests can shorten it.
@@ -719,6 +761,7 @@ public final class BridgeModel: ObservableObject {
             return endControlling(.failed("Could not start a session"))
         }
         controllerSession = session
+        qualitySent = false
 
         // The callbacks are stored on the session: they hold it weakly, or it could never be freed.
         session.onSignal = { [weak self, weak session] payload in
@@ -769,8 +812,21 @@ public final class BridgeModel: ObservableObject {
                 self.remoteDisplays = displays
             }
         }
+        // The host starts every session at Sharp: ask for the saved quality once input can flow.
+        // The channels may report open more than once.
+        session.onInputReady = { [weak self, weak session] in
+            guard let session else { return }
+            Task { @MainActor in
+                guard let self, self.controllerSession === session, !self.qualitySent else { return }
+                self.qualitySent = true
+                if self.preferredQuality != .sharp { session.send(.quality(self.preferredQuality)) }
+            }
+        }
         send(.request, to: host)
     }
+
+    /// Whether the controller session has asked for `preferredQuality` yet.
+    private var qualitySent = false
 
     /// Connects again to the Mac of the session that just ended or failed.
     public func reconnect() {
@@ -816,6 +872,7 @@ public final class BridgeModel: ObservableObject {
     }
 
     public func disconnect() {
+        cancelWaitingConnect()
         guard let controllerPeer else { return }
         send(.bye, to: controllerPeer)
         endControlling(.idle)
@@ -1340,6 +1397,7 @@ public final class BridgeModel: ObservableObject {
         static let deviceName = "deviceName"
         static let allowsControl = "allowsControl"
         static let forcesRelay = "forcesRelay"
+        static let qualityPreset = "qualityPreset"
         static let paired = "pairedDevices"
         static let sessionLog = "sessionLog"
         static let meta = "deviceMeta"

@@ -29,15 +29,20 @@ struct SessionView: View {
     @EnvironmentObject private var model: BridgeModel
     let video: RemoteVideo
     let host: PairedDevice?
-    @AppStorage("qualityPreset") private var qualityRaw: Int = Int(QualityPreset.sharp.rawValue)
     @AppStorage("viewMode") private var viewMode = ViewMode.fit
     @State private var showsStats = false
     @State private var toast: String?
 
+    /// A change applies now and is kept for the next session; the model asks for it when a session opens.
     private var quality: Binding<QualityPreset> {
         Binding(
-            get: { QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp },
-            set: { qualityRaw = Int($0.rawValue) }
+            get: { model.preferredQuality },
+            set: { preset in
+                guard preset != model.preferredQuality else { return }
+                model.preferredQuality = preset
+                model.sendInput(.quality(preset))
+                showToast(preset == .sharp ? "Quality: Sharp (60 fps)" : preset == .balanced ? "Quality: Balanced (30 fps)" : "Quality: Light (15 fps)")
+            }
         )
     }
 
@@ -58,10 +63,6 @@ struct SessionView: View {
             }
         }
         .frame(minWidth: 640, minHeight: 400)
-        .onAppear {
-            let preset = QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp
-            if preset != .sharp { model.sendInput(.quality(preset)) }
-        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button { showsStats.toggle() } label: {
@@ -107,14 +108,21 @@ struct SessionView: View {
         formatter.dateFormat = "yyyy-MM-dd-HHmmss"
         let hostSlug = (host.map(model.displayName) ?? "Mac").replacingOccurrences(of: "/", with: "-")
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+        var saved = false
         if let file = desktop?.appendingPathComponent("MacBridge-\(hostSlug)-\(formatter.string(from: Date())).jpg") {
-            try? data.write(to: file, options: .atomic)
+            saved = (try? data.write(to: file, options: .atomic)) != nil
         }
+        var copied = false
         if let img = NSImage(data: data) {
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([img])
+            copied = NSPasteboard.general.writeObjects([img])
         }
-        showToast("Screenshot saved to Desktop & copied")
+        switch (saved, copied) {
+        case (true, true): showToast("Screenshot saved to Desktop & copied")
+        case (true, false): showToast("Screenshot saved to Desktop")
+        case (false, true): showToast("Could not save to Desktop. Screenshot copied")
+        case (false, false): showToast("Could not save the screenshot")
+        }
     }
 
     // MARK: Screen
@@ -193,11 +201,6 @@ struct SessionView: View {
             Label("Quality", systemImage: "dial.medium")
         }
         .help("Lower the quality on a weak connection")
-        .onChange(of: qualityRaw) { _, raw in
-            let preset = QualityPreset(rawValue: UInt8(raw)) ?? .sharp
-            model.sendInput(.quality(preset))
-            showToast(preset == .sharp ? "Quality: Sharp (60 fps)" : preset == .balanced ? "Quality: Balanced (30 fps)" : "Quality: Light (15 fps)")
-        }
     }
 
     private var actionsMenu: some View {

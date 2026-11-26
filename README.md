@@ -86,7 +86,7 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
 - **Left:** this Mac's name and address, whether it is online, the **Allow control** switch and the pairing code.
 - **Connect to a Mac:** type a paired Mac's name or address and press Return, or type a pairing code to add a Mac.
 - **Tiles:** one per Mac you can control, with a picture from the last session, a dot (green online, grey offline) and when you last connected. Right-click to rename, mark as favourite or forget. Favourites come first.
-- The menu bar icon has **Connect to** with the same Macs.
+- **Menu bar icon:** **Connect to** with the same Macs (the Mac already on screen is only brought to the front), **Copy This Mac's Address** and **Show Pairing Code**. During a session it shows **Connected to** the Mac, with **Disconnect**.
 
 ## In a session
 
@@ -96,12 +96,13 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
   - *Name and connection* (click for details): direct or relayed, round trip, picture size, frame rate, bit rate, packets lost.
   - *Display*: choose which of the other Mac's displays to show.
   - *View*: Fit to Window, Fill Window (may cut the edges) or Actual Size.
-  - *Quality*: Sharp, Balanced or Light.
-  - *Actions*: previous and next desktop, Mission Control, Spotlight, switch app, send clipboard, lock screen.
+  - *Quality*: Sharp, Balanced or Light. The choice is kept for the next session.
+  - *Actions*: previous and next desktop, Mission Control, Spotlight, switch app, send clipboard, save screenshot (to the Desktop, and copied), lock screen.
   - *Full Screen*: move the pointer to the top edge to get the toolbar back.
   - *Disconnect*.
-- Control-← and Control-→ (switch desktop), Control-↑ and ⌘Space go to the other Mac while the session window is in front, if this Mac allows MacBridge under Accessibility. Without that, use the Actions menu.
-- Trackpad swipes between desktops and ⌘Tab stay on this Mac.
+- Control-← and Control-→ (switch desktop) and Control-↑ go to the other Mac while the session window is in front, if this Mac allows MacBridge under Accessibility. Without that, use the Actions menu.
+- ⌘Space, ⌘Tab and trackpad swipes between desktops stay on this Mac. Actions has *Spotlight* and *Switch App* to press them on the other Mac.
+- Closing the window during a session asks first, then disconnects.
 - If the session drops, the window offers **Reconnect**.
 
 ## On the Mac being controlled
@@ -127,8 +128,9 @@ open MacBridge.xcodeproj      # choose the MacBridgeMobile scheme and your devic
   - In both: two-finger tap is a right click, two-finger drag scrolls, pinch zooms the picture. While zoomed in, two fingers move the picture instead of scrolling.
 - **Keyboard:** the keyboard button opens the on-screen keyboard with a bar for ⌘ ⌥ ⌃ ⇧ (held for the next key), Esc, Tab, arrows and common shortcuts. A hardware keyboard works as on a Mac. On-screen typing assumes a US keyboard layout on the Mac; characters without a key are pasted.
 - **iPad with a mouse or trackpad:** the pointer, right click and scrolling go to the Mac.
-- **More menu:** desktops, Mission Control, Spotlight, switch app, lock, quality, connection details, and the clipboard: *Send Clipboard to Mac* and *Get Mac's Clipboard* (manual, because iOS asks for permission on every automatic read).
-- The session ends when the app goes to the background. Coming back offers to reconnect.
+- **More menu:** desktops, Mission Control, Spotlight, switch app, copy screenshot, lock, quality, connection details, and the clipboard: *Send Clipboard to Mac* and *Get Mac's Clipboard* (manual, because iOS asks for permission on every automatic read).
+- Pointer mode and quality changed during a session last for that session. The defaults are in Settings.
+- The screen stays on during a session. The session ends when the app goes to the background. Coming back offers to reconnect, and the call waits until the device is online again.
 
 ## Security
 

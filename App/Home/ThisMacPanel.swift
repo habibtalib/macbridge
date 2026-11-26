@@ -43,6 +43,7 @@ struct ThisMacPanel: View {
                     }
                     .buttonStyle(.borderless)
                     .help("Copy this Mac's address")
+                    .accessibilityLabel(copied ? "Address copied" : "Copy this Mac's address")
                 }
             }
 
@@ -93,7 +94,7 @@ struct ThisMacPanel: View {
             case .online:
                 Circle().fill(.green).frame(width: 8, height: 8)
                 Text("Online").foregroundStyle(.secondary)
-                if let host = URL(string: model.serverURL)?.host {
+                if let host = model.connectedServerURL?.host {
                     Text("· \(host)").font(.caption).foregroundStyle(.tertiary).lineLimit(1)
                 }
             case .connecting:
@@ -132,8 +133,10 @@ struct ThisMacPanel: View {
                     }
                     .buttonStyle(.borderless)
                     .help("Copy pairing code")
+                    .accessibilityLabel(copiedCode ? "Pairing code copied" : "Copy pairing code")
                 }
-                if let qr = Self.qrCode(PairingLink(code: code, server: model.serverURL).url?.absoluteString ?? code) {
+                // The server this Mac is on now, which is where the code was announced.
+                if let qr = Self.qrCode(PairingLink(code: code, server: model.connectedServerURL?.absoluteString).url?.absoluteString ?? code) {
                     Image(nsImage: qr).interpolation(.none).resizable().frame(width: 120, height: 120)
                         .padding(6).background(Color.white, in: RoundedRectangle(cornerRadius: 6))
                         .accessibilityLabel("Pairing code as a QR code, for MacBridge on iPhone or iPad")

@@ -7,15 +7,21 @@ struct SessionScreen: View {
     let video: RemoteVideo
     let host: PairedDevice
     @StateObject private var input: SessionInput
-    @AppStorage("qualityPreset") private var qualityRaw: Int = Int(QualityPreset.sharp.rawValue)
+    /// Set from this session's menu. It applies to this session only: Settings keeps the default.
+    @State private var sessionQuality: QualityPreset?
     @State private var barCollapsed = false
     @State private var showsStats = false
     @State private var note: String?
 
     private var quality: Binding<QualityPreset> {
         Binding(
-            get: { QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp },
-            set: { qualityRaw = Int($0.rawValue) }
+            get: { sessionQuality ?? model.preferredQuality },
+            set: { preset in
+                guard preset != (sessionQuality ?? model.preferredQuality) else { return }
+                sessionQuality = preset
+                model.sendInput(.quality(preset))
+                show(preset == .sharp ? "Quality: Sharp" : preset == .balanced ? "Quality: Balanced" : "Quality: Light")
+            }
         )
     }
 
@@ -23,6 +29,7 @@ struct SessionScreen: View {
         self.video = video
         self.host = host
         // A big screen is touched like the Mac's own; a phone works better as a trackpad.
+        // Switching during the session leaves this default as Settings has it.
         let saved = UserDefaults.standard.string(forKey: "pointerMode").flatMap(PointerMode.init)
         let mode = saved ?? (UIDevice.current.userInterfaceIdiom == .pad ? .direct : .trackpad)
         // The model is not available in init; onAppear points the input at it.
@@ -59,16 +66,14 @@ struct SessionScreen: View {
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
+        // The saved quality is asked for by the model once the session's channels are open.
         .onAppear {
             input.send = { [weak model] in model?.sendInput($0) }
-            let preset = QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp
-            if preset != .sharp { model.sendInput(.quality(preset)) }
         }
         .onDisappear {
             Thumbnails.save(from: video, for: host.id)
         }
         .onChange(of: input.mode) { _, mode in
-            UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode")
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             show(mode == .trackpad ? "Trackpad: drag to move, tap to click" : "Touch: tap where you want to click")
         }
@@ -189,11 +194,6 @@ struct SessionScreen: View {
             Button { showsStats = true } label: { Label("Connection Details", systemImage: "waveform.path.ecg") }
         } label: { barIcon("ellipsis.circle") }
         .accessibilityLabel("More")
-        .onChange(of: qualityRaw) { _, raw in
-            let preset = QualityPreset(rawValue: UInt8(raw)) ?? .sharp
-            model.sendInput(.quality(preset))
-            show(preset == .sharp ? "Quality: Sharp" : preset == .balanced ? "Quality: Balanced" : "Quality: Light")
-        }
     }
 
     private func barIcon(_ symbol: String, tint: Color = .primary) -> some View {
@@ -212,27 +212,27 @@ private struct KeyBar: View {
     @ObservedObject var input: SessionInput
     let onPasteFromDevice: () -> Void
 
-    private let modifiers: [(String, WireModifiers)] = [("⌘", .command), ("⌥", .option), ("⌃", .control), ("⇧", .shift)]
+    private let modifiers: [(String, String, WireModifiers)] = [("⌘", "Command", .command), ("⌥", "Option", .option),
+                                                                ("⌃", "Control", .control), ("⇧", "Shift", .shift)]
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(modifiers, id: \.0) { title, modifier in
-                    key(title, on: input.sticky.contains(modifier)) {
+                ForEach(modifiers, id: \.0) { title, name, modifier in
+                    key(title, label: "Hold \(name) for the next key", on: input.sticky.contains(modifier)) {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         if input.sticky.contains(modifier) { input.sticky.remove(modifier) } else { input.sticky.insert(modifier) }
                     }
-                    .accessibilityLabel("Hold \(title) for the next key")
                 }
                 Divider().frame(height: 24)
-                key("esc") { tap(MacKey.escape) }
-                key("tab") { tap(MacKey.tab) }
-                key("⌫") { tap(MacKey.delete) }
-                key("↩") { tap(MacKey.returnKey) }
-                key("←") { tap(MacKey.leftArrow) }
-                key("↓") { tap(MacKey.downArrow) }
-                key("↑") { tap(MacKey.upArrow) }
-                key("→") { tap(MacKey.rightArrow) }
+                key("esc", label: "Escape") { tap(MacKey.escape) }
+                key("tab", label: "Tab") { tap(MacKey.tab) }
+                key("⌫", label: "Delete") { tap(MacKey.delete) }
+                key("↩", label: "Return") { tap(MacKey.returnKey) }
+                key("←", label: "Left arrow") { tap(MacKey.leftArrow) }
+                key("↓", label: "Down arrow") { tap(MacKey.downArrow) }
+                key("↑", label: "Up arrow") { tap(MacKey.upArrow) }
+                key("→", label: "Right arrow") { tap(MacKey.rightArrow) }
                 Divider().frame(height: 24)
                 Button(action: onPasteFromDevice) {
                     Image(systemName: "doc.on.clipboard")
@@ -243,13 +243,13 @@ private struct KeyBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Paste from this device")
-                key("⌃C") { tap(8, holding: .control) }
-                key("⌘C") { tap(8, holding: .command) }
-                key("⌘V") { tap(9, holding: .command) }
-                key("⌘Z") { tap(6, holding: .command) }
-                key("⌘A") { tap(0, holding: .command) }
-                key("⌘W") { tap(13, holding: .command) }
-                key("⌘T") { tap(17, holding: .command) }
+                key("⌃C", label: "Control C") { tap(8, holding: .control) }
+                key("⌘C", label: "Command C, copy") { tap(8, holding: .command) }
+                key("⌘V", label: "Command V, paste") { tap(9, holding: .command) }
+                key("⌘Z", label: "Command Z, undo") { tap(6, holding: .command) }
+                key("⌘A", label: "Command A, select all") { tap(0, holding: .command) }
+                key("⌘W", label: "Command W, close window") { tap(13, holding: .command) }
+                key("⌘T", label: "Command T, new tab") { tap(17, holding: .command) }
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
         }
@@ -261,7 +261,7 @@ private struct KeyBar: View {
         input.press(keyCode, holding: holding)
     }
 
-    private func key(_ title: String, on: Bool = false, action: @escaping () -> Void) -> some View {
+    private func key(_ title: String, label: String, on: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title).font(.system(size: 16, weight: .medium, design: .rounded))
                 .frame(minWidth: 40, minHeight: 36).padding(.horizontal, 4)
@@ -269,6 +269,8 @@ private struct KeyBar: View {
                 .foregroundStyle(on ? Color.white : Color.primary)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }
 

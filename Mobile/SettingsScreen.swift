@@ -5,7 +5,6 @@ struct SettingsScreen: View {
     @EnvironmentObject private var model: BridgeModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage("pointerMode") private var pointerModeRaw: String = (UIDevice.current.userInterfaceIdiom == .pad ? PointerMode.direct.rawValue : PointerMode.trackpad.rawValue)
-    @AppStorage("qualityPreset") private var qualityRaw: Int = Int(QualityPreset.sharp.rawValue)
     @State private var copied = false
     // Server and token are edited as drafts and applied on Return, on leaving the field, on
     // Go online or on Done: each server keeps its own token, and a half-typed address must
@@ -52,15 +51,15 @@ struct SettingsScreen: View {
                         Text("Trackpad").tag(PointerMode.trackpad.rawValue)
                         Text("Touch").tag(PointerMode.direct.rawValue)
                     }
-                    Picker("Default quality", selection: $qualityRaw) {
-                        Text("Sharp (60 fps)").tag(Int(QualityPreset.sharp.rawValue))
-                        Text("Balanced (30 fps)").tag(Int(QualityPreset.balanced.rawValue))
-                        Text("Light (15 fps)").tag(Int(QualityPreset.light.rawValue))
+                    Picker("Default quality", selection: $model.preferredQuality) {
+                        Text("Sharp (60 fps)").tag(QualityPreset.sharp)
+                        Text("Balanced (30 fps)").tag(QualityPreset.balanced)
+                        Text("Light (15 fps)").tag(QualityPreset.light)
                     }
                 } header: {
                     Text("Session Defaults")
                 } footer: {
-                    Text("You can also switch pointer mode and quality any time during a session.")
+                    Text("You can also switch pointer mode and quality during a session. That change lasts for the session only.")
                 }
 
                 Section {

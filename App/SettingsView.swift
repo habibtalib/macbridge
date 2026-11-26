@@ -41,11 +41,15 @@ private struct GeneralSettings: View {
                 Text("The name is what other Macs see when they pair with this one.")
             }
             Section {
-                Toggle("Open MacBridge at login", isOn: $startsAtLogin)
-                    .onChange(of: startsAtLogin) { _, enabled in
+                // Set through the binding, not onChange: reading the real state back must not
+                // count as another change, which would clear the error just shown.
+                Toggle("Open MacBridge at login", isOn: Binding(
+                    get: { startsAtLogin },
+                    set: { enabled in
                         loginItemError = LoginItem.setEnabled(enabled)
                         startsAtLogin = LoginItem.isEnabled
                     }
+                ))
                 if let loginItemError {
                     Text(loginItemError).font(.callout).foregroundStyle(.red)
                 }
@@ -59,6 +63,8 @@ private struct GeneralSettings: View {
 
 private struct SecuritySettings: View {
     @EnvironmentObject private var model: BridgeModel
+    /// The Mac whose right to control this one waits for a yes to be removed.
+    @State private var removing: PairedDevice?
 
     var body: some View {
         Form {
@@ -116,7 +122,7 @@ private struct SecuritySettings: View {
                         ))
                         .toggleStyle(.checkbox)
                         .help("Show Accept and Decline on this Mac before \(model.displayName(device)) can connect. Leave off for a Mac nobody sits at.")
-                        Button("Remove", role: .destructive) { model.revokeControl(from: device) }
+                        Button("Remove…", role: .destructive) { removing = device }
                     }
                 }
             }
@@ -133,6 +139,14 @@ private struct SecuritySettings: View {
         }
         .formStyle(.grouped)
         .onAppear { model.refreshPermissions() }
+        .alert(removing.map { "Stop \(model.displayName($0)) from controlling this Mac?" } ?? "",
+               isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+               presenting: removing) { device in
+            Button("Remove", role: .destructive) { model.revokeControl(from: device) }
+            Button("Cancel", role: .cancel) {}
+        } message: { device in
+            Text("A session it has open ends now. To control this Mac again, it needs a new pairing code from here.")
+        }
     }
 
     private static func describe(_ entry: SessionLogEntry) -> String {

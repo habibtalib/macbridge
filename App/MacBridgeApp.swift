@@ -65,6 +65,22 @@ final class Launch: ObservableObject {
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated { model.prepareForQuit() }
             }
+            // The menu bar menu shows which Macs are online: ask again whenever it opens. Menus of
+            // the main menu bar have a supermenu; the status item's menu has none.
+            NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { note in
+                guard let menu = note.object as? NSMenu, menu.supermenu == nil, menu !== NSApp.mainMenu else { return }
+                MainActor.assumeIsolated { model.refreshPresence() }
+            }
+        }
+    }
+}
+
+extension BridgeModel {
+    /// The Mac this one is calling or controlling, if any.
+    var sessionHost: PairedDevice? {
+        switch controllerStatus {
+        case let .calling(host), let .connected(host): return host
+        case .idle, .failed: return nil
         }
     }
 }
@@ -73,6 +89,10 @@ struct RootView: View {
     @EnvironmentObject private var model: BridgeModel
 
     var body: some View {
+        content.background(SessionCloseGuardView(model: model))
+    }
+
+    @ViewBuilder private var content: some View {
         switch model.controllerStatus {
         case .idle:
             HomeView()
@@ -80,7 +100,9 @@ struct RootView: View {
             if let video = model.remoteVideo {
                 SessionView(video: video, host: host)
             } else {
+                // A new host starts a new timer.
                 ConnectingView(name: model.displayName(host)) { model.disconnect() }
+                    .id(host.id)
             }
         case let .failed(reason):
             DroppedView(
@@ -89,6 +111,86 @@ struct RootView: View {
                 close: { model.dismissFailure() }
             )
         }
+    }
+}
+
+/// Puts `SessionCloseGuard` on the window this view is in.
+private struct SessionCloseGuardView: NSViewRepresentable {
+    let model: BridgeModel
+
+    func makeCoordinator() -> SessionCloseGuard { SessionCloseGuard(model: model) }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = WindowWatcher()
+        view.onWindow = { [weak guardian = context.coordinator] window in guardian?.attach(to: window) }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        // SwiftUI may set its own delegate again.
+        context.coordinator.attach(to: view.window)
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: SessionCloseGuard) {
+        coordinator.detach()
+    }
+
+    private final class WindowWatcher: NSView {
+        var onWindow: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onWindow?(window)
+        }
+    }
+}
+
+/// Closing the window in the middle of a session would leave the session running with nothing
+/// on screen: ask first. Stands in as the window's delegate and passes everything else on to
+/// the delegate SwiftUI set.
+@MainActor
+final class SessionCloseGuard: NSObject, NSWindowDelegate {
+    private let model: BridgeModel
+    private weak var window: NSWindow?
+    private var original: NSWindowDelegate?
+
+    init(model: BridgeModel) { self.model = model }
+
+    func attach(to window: NSWindow?) {
+        guard let window, window.delegate !== self else { return }
+        detach()
+        original = window.delegate
+        self.window = window
+        window.delegate = self
+    }
+
+    func detach() {
+        if let window, window.delegate === self { window.delegate = original }
+        window = nil
+        original = nil
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        super.responds(to: aSelector) || original?.responds(to: aSelector) == true
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        original?.responds(to: aSelector) == true ? original : super.forwardingTarget(for: aSelector)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard let host = model.sessionHost else { return original?.windowShouldClose?(sender) ?? true }
+        guard sender.attachedSheet == nil else { return false }
+        let alert = NSAlert()
+        alert.messageText = "Disconnect from \(model.displayName(host))?"
+        alert.informativeText = "Closing the window ends the session."
+        alert.addButton(withTitle: "Disconnect")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: sender) { [weak self, weak sender] response in
+            guard response == .alertFirstButtonReturn, let self, let sender else { return }
+            self.model.disconnect()
+            sender.performClose(nil)
+        }
+        return false
     }
 }
 
@@ -131,18 +233,25 @@ private struct MenuBarContent: View {
         case .idle:
             Text(statusLine)
         }
-        Divider()
-        Button("Open MacBridge") {
-            openWindow(id: "main")
-            NSApplication.shared.activate(ignoringOtherApps: true)
+        switch model.controllerStatus {
+        case let .connected(host):
+            Text("Connected to \(model.displayName(host))")
+            Button("Disconnect") { model.disconnect() }
+        case let .calling(host):
+            Text("Connecting to \(model.displayName(host))…")
+            Button("Cancel") { model.disconnect() }
+        case .idle, .failed:
+            EmptyView()
         }
+        Divider()
+        Button("Open MacBridge", action: showWindow)
         if !model.controllable.isEmpty {
             Menu("Connect to") {
                 ForEach(model.controllableSorted) { device in
                     Button {
-                        openWindow(id: "main")
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        model.connect(to: device)
+                        showWindow()
+                        // The Mac already on screen is only brought forward.
+                        if model.sessionHost?.id != device.id { model.connect(to: device) }
                     } label: {
                         // Menus draw text only: the dot says what the server last reported.
                         Text((model.presence[device.id] == true ? "● " : model.presence[device.id] == false ? "○ " : "") + model.displayName(device))
@@ -158,14 +267,18 @@ private struct MenuBarContent: View {
         }
         if model.allowsControl, model.signalingStatus == .online {
             Button("Show Pairing Code") {
-                openWindow(id: "main")
-                NSApplication.shared.activate(ignoringOtherApps: true)
+                showWindow()
                 model.showPairingCode()
             }
         }
         Divider()
         Button("Quit MacBridge") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    private func showWindow() {
+        openWindow(id: "main")
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     private var statusLine: String {

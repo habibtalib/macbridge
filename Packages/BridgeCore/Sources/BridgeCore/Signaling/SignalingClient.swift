@@ -92,7 +92,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     /// Most IDs the server answers in one presence request.
     static let presenceBatch = 64
 
-    private let url: URL
+    public let url: URL
     private let identity: Identity
     private let accessToken: String?
     private let queue = DispatchQueue(label: "macbridge.signaling")

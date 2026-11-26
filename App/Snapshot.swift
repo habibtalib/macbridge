@@ -14,8 +14,9 @@ enum Snapshot {
     static var path: String? { ProcessInfo.processInfo.environment["MACBRIDGE_SNAPSHOT"] }
     static var view: String { ProcessInfo.processInfo.environment["MACBRIDGE_SNAPSHOT_VIEW"] ?? "home" }
     static var isActive: Bool { path != nil }
-    /// The sample tile picture, removed again after the render.
-    private static var samplePicture: URL?
+    /// Holds the sample tile picture (`Thumbnails.folder` is a temporary folder in this mode);
+    /// removed again after the render.
+    private static var samplePictures: URL?
 
     static func sampleModel() -> BridgeModel {
         let suite = "macbridge-snapshot"
@@ -43,8 +44,8 @@ enum Snapshot {
             if let sample = NSImage(contentsOfFile: "/System/Library/CoreServices/DefaultDesktop.heic")?.tiffRepresentation,
                let jpeg = NSBitmapImageRep(data: sample)?.representation(using: .jpeg, properties: [:]) {
                 try? FileManager.default.createDirectory(at: Thumbnails.folder, withIntermediateDirectories: true)
-                let url = Thumbnails.url(for: devices[0].id)
-                if !FileManager.default.fileExists(atPath: url.path), (try? jpeg.write(to: url)) != nil { samplePicture = url }
+                samplePictures = Thumbnails.folder
+                try? jpeg.write(to: Thumbnails.url(for: devices[0].id))
             }
         }
         defaults.set("Dark-MBP", forKey: "deviceName")
@@ -97,7 +98,7 @@ enum Snapshot {
                 host.cacheDisplay(in: host.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
             }
-            if let samplePicture { try? FileManager.default.removeItem(at: samplePicture) }
+            if let samplePictures { try? FileManager.default.removeItem(at: samplePictures) }
             exit(0)
         }
     }
