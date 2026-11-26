@@ -7,6 +7,18 @@ const list = (value: string | undefined) =>
     .filter(Boolean);
 
 const env = process.env;
+
+/** A positive whole number from the environment, or undefined to keep the default. */
+const count = (name: string): number | undefined => {
+  const value = env[name];
+  if (value === undefined || value === "") return undefined;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    console.error(`${name} must be a whole number above 0.`);
+    process.exit(1);
+  }
+  return number;
+};
 const port = Number(env.PORT ?? 8787);
 const host = env.HOST ?? "0.0.0.0";
 const accessToken = env.ACCESS_TOKEN || undefined;
@@ -31,6 +43,14 @@ const server = await startSignalingServer({
   accessToken,
   stunUrls: list(env.STUN_URLS),
   turn: env.TURN_SECRET ? { secret: env.TURN_SECRET, urls: turnUrls } : undefined,
+  limits: {
+    messagesPerSecond: count("RATE_LIMIT_PER_SECOND"),
+    burst: count("RATE_LIMIT_BURST"),
+    maxBufferedBytes: count("MAX_BUFFERED_BYTES"),
+    maxConnections: count("MAX_CONNECTIONS"),
+    maxConnectionsPerIp: count("MAX_CONNECTIONS_PER_IP"),
+  },
+  trustProxy: env.TRUST_PROXY === "1",
   log: (line) => console.log(new Date().toISOString(), line),
 });
 console.log(

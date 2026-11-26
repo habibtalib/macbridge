@@ -231,6 +231,137 @@ struct BridgeModelTests {
         #expect(studio.pendingRequest == nil)
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func revokingAnswersAQuestionStillShowing() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.allowsControl = true
+        let laptopAtStudio = try #require(studio.controllers.first)
+        studio.setAsksFirst(laptopAtStudio, true)
+
+        laptop.connect(to: try #require(laptop.controllable.first))
+        try await poll("studio asks") { studio.pendingRequest?.peer.id == laptop.deviceID }
+        studio.revokeControl(from: laptopAtStudio)
+        #expect(studio.pendingRequest == nil)
+        studio.acceptRequest() // too late: nothing is waiting
+        try await poll("laptop is told") { laptop.controllerStatus == .failed("Studio did not accept the connection") }
+        #expect(studio.hostStatus == .idle)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func acceptingAfterRevokingDoesNotLetTheMacIn() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.allowsControl = true
+        let laptopAtStudio = try #require(studio.controllers.first)
+        studio.setAsksFirst(laptopAtStudio, true)
+
+        laptop.connect(to: try #require(laptop.controllable.first))
+        try await poll("studio asks") { studio.pendingRequest?.peer.id == laptop.deviceID }
+        // Accepted, then revoked before the session starts: the session must look the right up again.
+        studio.acceptRequest()
+        studio.revokeControl(from: laptopAtStudio)
+        try await poll("laptop is told") { laptop.controllerStatus == .failed("Studio did not accept the connection") }
+        #expect(studio.hostStatus == .idle)
+        #expect(studio.notice?.contains("tried to connect") != true) // turned away before any permission check
+    }
+
+    /// A model with a token but no server yet, as on first launch.
+    private func makeUnsetModel(_ name: String, token: String = LocalServer.token) -> BridgeModel {
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory(token))
+        model.deviceName = name
+        return model
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func firstTimeSetupPairsFromOneScan() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let studio = makeModel("Studio", server: server), phone = makeUnsetModel("Phone")
+        defer { studio.goOffline(); phone.goOffline() }
+        studio.goOnline()
+        try await poll("studio online") { studio.signalingStatus == .online }
+        studio.showPairingCode()
+        let code = try #require(shownCode(studio))
+        try await Task.sleep(for: .milliseconds(200))
+
+        phone.pair(using: PairingLink(code: code, server: server.url.absoluteString))
+        #expect(phone.pairingStatus == .waiting) // no question first
+        try await poll("paired") { studio.paired.count == 1 && phone.paired.count == 1 }
+        #expect(phone.serverURL == server.url.absoluteString)
+        #expect(phone.accessToken == LocalServer.token)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aLinkToAnotherServerAsksAndNeverSendsTheToken() async throws {
+        let server = try await LocalServer.start(), other = try await LocalServer.start()
+        defer { server.stop(); other.stop() }
+        let phone = makeModel("Phone", server: server)
+        defer { phone.goOffline() }
+        phone.goOnline()
+        try await poll("phone online") { phone.signalingStatus == .online }
+
+        let link = PairingLink(code: PairingCode().display, server: other.url.absoluteString)
+        phone.pair(using: link)
+        #expect(phone.pairingStatus == .confirmServer(other.url.absoluteString))
+        #expect(phone.serverURL == server.url.absoluteString)
+        #expect(phone.accessToken == LocalServer.token)
+        #expect(phone.signalingStatus == .online)
+
+        // Cancelled: nothing changes.
+        phone.cancelPairing()
+        phone.confirmServerSwitch()
+        #expect(phone.serverURL == server.url.absoluteString)
+
+        // Confirmed: the new server gets no token, so it refuses this device.
+        phone.pair(using: link)
+        phone.confirmServerSwitch()
+        #expect(phone.serverURL == other.url.absoluteString)
+        #expect(phone.accessToken == "")
+        try await poll("refused for lack of a token") { phone.notice == "The server refused the access token." }
+
+        // The first server's token is still kept for it.
+        phone.serverURL = server.url.absoluteString
+        #expect(phone.accessToken == LocalServer.token)
+    }
+
+    @Test func tokensAreKeptPerServer() throws {
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("wss://a.example.com/", forKey: "serverURL")
+        let secrets = SecretStore.inMemory("old-single-token")
+
+        // The one token of an older version belongs to the server saved then.
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets)
+        #expect(model.accessToken == "old-single-token")
+        #expect(secrets.token("wss://a.example.com") == "old-single-token")
+        #expect(secrets.token("") == "")
+
+        // Typing a new address in Settings moves the token along, keystroke by keystroke.
+        model.serverURL = "wss://b"
+        model.serverURL = "WSS://B.example.com/"
+        #expect(model.accessToken == "old-single-token")
+        #expect(secrets.token("wss://b") == "" && secrets.token("wss://a.example.com") == "")
+        #expect(secrets.token("wss://b.example.com") == "old-single-token")
+
+        // A server that has its own token gets that one, and the one left keeps its own.
+        secrets.setToken("token-c", "wss://c.example.com")
+        model.serverURL = "wss://c.example.com"
+        #expect(model.accessToken == "token-c")
+        model.serverURL = "wss://b.example.com"
+        #expect(model.accessToken == "old-single-token")
+        #expect(secrets.token("wss://c.example.com") == "token-c")
+        #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets).accessToken == "old-single-token")
+    }
+
     @Test func pairedDevicesSurviveARestart() throws {
         let suite = "macbridge-tests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))

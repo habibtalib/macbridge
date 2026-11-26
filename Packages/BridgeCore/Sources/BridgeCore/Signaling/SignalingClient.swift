@@ -220,15 +220,18 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             presenceWaiters.removeAll()
             waiters.forEach { $0(Set(online)) }
         case let .error(error):
-            if error == .other("bad-message"), !presenceWaiters.isEmpty {
-                // The server does not know the request. It closes the connection; the reconnect
-                // that follows must not ask again.
+            let unsupported = error == .other("unsupported")
+            if error == .other("bad-message") || unsupported, !presenceWaiters.isEmpty {
+                // The server does not know the request. An older one closes the connection; the
+                // reconnect that follows must not ask again.
                 presenceUnsupported = true
                 let waiters = presenceWaiters
                 presenceWaiters.removeAll()
                 waiters.forEach { $0(nil) }
                 return
             }
+            // A newer server says it does not know a message and stays connected: nothing to show.
+            if unsupported { return }
             if case .unauthorized = error { stop() }
             DispatchQueue.main.async { self.onError?(error) }
         }

@@ -359,8 +359,12 @@ extension PeerSession: RTCPeerConnectionDelegate {
     }
 
     public func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
-        // Controller side: these are the channels the host opened.
+        // Controller side: these are the channels the host opened. The host takes input only on
+        // the channels it created itself: one the controller opens gets no delegate, so nothing
+        // it carries is read, and it cannot replace the host's own.
+        guard role == .controller else { return }
         queue.async {
+            guard !self.isClosed else { return }
             switch dataChannel.label {
             case Self.reliableLabel: self.reliableChannel = dataChannel
             case Self.fastLabel: self.fastChannel = dataChannel

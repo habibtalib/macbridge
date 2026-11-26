@@ -84,6 +84,8 @@ public enum InputMessageError: Error, Equatable {
     case unknownType(UInt8)
     case unknownButton(UInt8)
     case invalidText
+    /// Clipboard text over `InputMessage.maxClipboardBytes`.
+    case tooLong
     case invalidCoordinate
     case unknownQuality(UInt8)
 }
@@ -183,6 +185,9 @@ extension InputMessage {
             let isDown = try r.u8() != 0
             self = .key(keyCode: keyCode, isDown: isDown, modifiers: try r.u32())
         case .clipboard:
+            // The sender caps what it sends; a peer that does not is refused here, before
+            // the text reaches the pasteboard.
+            guard r.remaining <= Self.maxClipboardBytes else { throw InputMessageError.tooLong }
             guard let text = String(data: r.rest(), encoding: .utf8) else {
                 throw InputMessageError.invalidText
             }
@@ -260,6 +265,8 @@ private struct Reader {
         defer { offset += count }
         return Data(bytes[offset..<offset + count])
     }
+
+    var remaining: Int { bytes.count - offset }
 
     mutating func rest() -> Data {
         defer { offset = bytes.count }

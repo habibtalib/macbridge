@@ -228,7 +228,7 @@ describe("relay", () => {
     expect(await laptop.next()).toEqual({ type: "error", code: "offline", to: studio.id });
   });
 
-  it.each(["not json", "[]", '"text"', '{"type":"signal","to":"x"}', '{"type":"signal","to":1,"data":{}}', '{"type":"nope"}'])(
+  it.each(["not json", "[]", '"text"', '{"type":"signal","to":"x"}', '{"type":"signal","to":1,"data":{}}'])(
     "rejects malformed message %s",
     async (raw) => {
       await start();
@@ -238,6 +238,15 @@ describe("relay", () => {
       expect(await device.closed).toBe(CLOSE.protocol);
     },
   );
+
+  it("answers a type it does not know and stays connected", async () => {
+    await start();
+    const device = await Device.online();
+    device.send({ type: "nope" });
+    expect(await device.next()).toEqual({ type: "error", code: "unsupported" });
+    device.send({ type: "ice" });
+    expect(await device.next()).toEqual({ type: "ice", servers: [] });
+  });
 
   it("closes connections that send oversized messages", async () => {
     await start();
@@ -381,5 +390,57 @@ describe("presence", () => {
     const device = await Device.open();
     device.send({ type: "presence", ids: [] });
     expect(await device.next()).toEqual({ type: "error", code: "bad-message" });
+  });
+});
+
+describe("limits", () => {
+  it("closes a connection that sends faster than its rate", async () => {
+    let nowMs = 1_000_000;
+    await start({ limits: { messagesPerSecond: 2, burst: 5 }, now: () => nowMs });
+    const device = await Device.online(); // hello and auth use 2 of the 5
+    device.send({ type: "ice" });
+    expect(await device.next()).toMatchObject({ type: "ice" });
+    device.send({ type: "ice" });
+    expect(await device.next()).toMatchObject({ type: "ice" });
+    // After a second, two more are allowed.
+    nowMs += 1000;
+    for (let i = 0; i < 3; i++) device.send({ type: "ice" });
+    for (let i = 0; i < 3; i++) expect(await device.next()).toMatchObject({ type: "ice" });
+    device.send({ type: "ice" });
+    expect(await device.next()).toEqual({ type: "error", code: "rate-limited" });
+    expect(await device.closed).toBe(CLOSE.rateLimited);
+  });
+
+  it.each([
+    { maxConnections: 2, maxConnectionsPerIp: 10 },
+    { maxConnections: 10, maxConnectionsPerIp: 2 },
+  ])("caps connections %j", async (limits) => {
+    await start({ limits });
+    const first = await Device.online();
+    await Device.online();
+    const third = await Device.open();
+    expect(await third.next()).toEqual({ type: "error", code: "busy" });
+    expect(await third.closed).toBe(CLOSE.busy);
+
+    // A slot frees up when a connection ends.
+    first.socket.close();
+    await first.closed;
+    await Device.online();
+  });
+
+  it("counts the address the proxy names when told to trust it", async () => {
+    await start({ limits: { maxConnectionsPerIp: 1 }, trustProxy: true });
+    const viaProxy = (ip: string) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${server.port}`, { headers: { "x-forwarded-for": `198.51.100.9, ${ip}` } });
+      sockets.push(socket);
+      return new Promise<number | "open">((resolve) => {
+        socket.once("close", (code) => resolve(code));
+        socket.once("message", () => socket.once("close", (code) => resolve(code)));
+        setTimeout(() => resolve("open"), 300);
+      });
+    };
+    expect(await viaProxy("203.0.113.1")).toBe("open");
+    expect(await viaProxy("203.0.113.2")).toBe("open");
+    expect(await viaProxy("203.0.113.1")).toBe(CLOSE.busy);
   });
 });

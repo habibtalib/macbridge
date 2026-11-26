@@ -26,7 +26,9 @@ import { WebSocketServer, WebSocket } from "ws";
  *   { type: "signal" | "pair" | "pair-reply", from, data }
  *   { type: "ice", servers: [{ urls, username?, credential? }] }
  *   { type: "error", code, to? }        offline, no-such-pairing, bad-message,
- *                                       bad-id, bad-token, bad-auth, hello-timeout
+ *                                       bad-id, bad-token, bad-auth, hello-timeout,
+ *                                       unsupported (a type this server does not know;
+ *                                       the connection stays open), rate-limited, busy
  */
 
 const ID_PATTERN = /^[a-z2-7]{16}$/;
@@ -38,12 +40,28 @@ const PAIRING_LIFETIME_MS = 10 * 60_000;
 /** Most device IDs one presence request may name. */
 const MAX_PRESENCE_IDS = 64;
 
+/** Defaults for `SignalingServerOptions.limits`. */
+export const DEFAULT_LIMITS = {
+  /** Messages a connection may send per second, on average. Signaling needs a few dozen at most. */
+  messagesPerSecond: 50,
+  /** Messages a connection may send in one burst. */
+  burst: 100,
+  /** A peer that reads too slowly is dropped once this much waits to be sent to it. */
+  maxBufferedBytes: 1024 * 1024,
+  maxConnections: 1000,
+  maxConnectionsPerIp: 20,
+} as const;
+
+export type Limits = { -readonly [K in keyof typeof DEFAULT_LIMITS]: number };
+
 /** Application close codes (4000–4999 are free for private use). */
 export const CLOSE = {
   protocol: 4000,
   replaced: 4001,
   helloTimeout: 4002,
   unauthorized: 4003,
+  rateLimited: 4004,
+  busy: 4005,
 } as const;
 
 export interface TurnOptions {
@@ -63,6 +81,14 @@ export interface SignalingServerOptions {
   stunUrls?: string[];
   turn?: TurnOptions;
   log?: (line: string) => void;
+  /** Rate and connection limits; anything not given takes its `DEFAULT_LIMITS` value. */
+  limits?: Partial<Limits>;
+  /**
+   * Count connections per IP by the last X-Forwarded-For address. Only for a server that
+   * is reachable through a reverse proxy alone, which sets that header; otherwise every
+   * connection would share the proxy's address.
+   */
+  trustProxy?: boolean;
   /** Clock, for tests. */
   now?: () => number;
 }
@@ -138,6 +164,9 @@ interface Client {
   pending: { id: string; key: Buffer; nonce: string } | null;
   alive: boolean;
   pairing: { tag: string; timer: NodeJS.Timeout } | null;
+  /** Token bucket: messages this connection may still send, refilled over time. */
+  tokens: number;
+  refilledAt: number;
 }
 
 export function startSignalingServer(options: SignalingServerOptions): Promise<SignalingServer> {
@@ -145,6 +174,11 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
   const now = options.now ?? Date.now;
   const devices = new Map<string, Client>();
   const pairings = new Map<string, Client>();
+  const limits: Limits = { ...DEFAULT_LIMITS };
+  for (const [name, value] of Object.entries(options.limits ?? {}) as [keyof Limits, number | undefined][]) {
+    if (value !== undefined) limits[name] = value;
+  }
+  const perIp = new Map<string, number>();
   const wss = new WebSocketServer({
     port: options.port,
     host: options.host,
@@ -152,7 +186,10 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
   });
 
   const send = (socket: WebSocket, message: object) => {
-    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    if (socket.readyState !== WebSocket.OPEN) return;
+    // A peer that does not read would make the server hold everything sent to it.
+    if (socket.bufferedAmount > limits.maxBufferedBytes) return socket.terminate();
+    socket.send(JSON.stringify(message));
   };
 
   const closePairing = (client: Client) => {
@@ -162,8 +199,29 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
     client.pairing = null;
   };
 
-  wss.on("connection", (socket) => {
-    const client: Client = { socket, id: null, pending: null, alive: true, pairing: null };
+  wss.on("connection", (socket, request) => {
+    const forwarded = options.trustProxy ? request.headers["x-forwarded-for"] : undefined;
+    const ip =
+      (typeof forwarded === "string" ? forwarded.split(",").pop()?.trim() : undefined) ||
+      request.socket.remoteAddress ||
+      "unknown";
+    // wss.clients already holds this connection.
+    if (wss.clients.size > limits.maxConnections || (perIp.get(ip) ?? 0) >= limits.maxConnectionsPerIp) {
+      send(socket, { type: "error", code: "busy" });
+      socket.close(CLOSE.busy);
+      return;
+    }
+    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+
+    const client: Client = {
+      socket,
+      id: null,
+      pending: null,
+      alive: true,
+      pairing: null,
+      tokens: limits.burst,
+      refilledAt: now(),
+    };
 
     const helloTimer = setTimeout(() => {
       if (client.id === null) {
@@ -190,6 +248,11 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
     });
 
     socket.on("message", (raw, isBinary) => {
+      const time = now();
+      client.tokens = Math.min(limits.burst, client.tokens + ((time - client.refilledAt) / 1000) * limits.messagesPerSecond);
+      client.refilledAt = time;
+      if (client.tokens < 1) return reject("rate-limited", CLOSE.rateLimited);
+      client.tokens -= 1;
       if (isBinary) return reject("bad-message");
       let message: unknown;
       try {
@@ -283,11 +346,16 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
           return forward("pair-reply", to, data);
 
         default:
-          return reject("bad-message");
+          if (typeof type !== "string" || Array.isArray(message)) return reject("bad-message");
+          // A newer client may know types this server does not: say so and stay connected.
+          return send(socket, { type: "error", code: "unsupported" });
       }
     });
 
     socket.on("close", () => {
+      const left = (perIp.get(ip) ?? 1) - 1;
+      if (left > 0) perIp.set(ip, left);
+      else perIp.delete(ip);
       clearTimeout(helloTimer);
       closePairing(client);
       if (client.id !== null && devices.get(client.id) === client) {

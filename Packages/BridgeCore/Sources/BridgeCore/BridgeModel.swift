@@ -37,12 +37,24 @@ public final class BridgeModel: ObservableObject {
         case showingCode(String, expires: Date)
         /// This Mac sent a typed code and is waiting for the other Mac.
         case waiting
+        /// A pairing link names another server than the one set. Switching waits for
+        /// a yes, so a link cannot move this device to a server nobody chose.
+        case confirmServer(String)
         case failed(String)
     }
 
     // Settings, saved as they change.
-    @Published public var serverURL: String { didSet { defaults.set(serverURL, forKey: Keys.serverURL) } }
-    @Published public var accessToken: String { didSet { secrets.setAccessToken(accessToken) } }
+    @Published public var serverURL: String {
+        didSet {
+            defaults.set(serverURL, forKey: Keys.serverURL)
+            serverChanged(from: oldValue)
+        }
+    }
+    /// The token for the current server. Each server keeps its own, so a token
+    /// is only ever sent to the server it was entered for.
+    @Published public var accessToken: String { didSet { secrets.setToken(accessToken, Self.serverKey(serverURL)) } }
+    /// Set while a confirmed pairing link switches the server.
+    private var switchingByLink = false
     @Published public var deviceName: String { didSet { defaults.set(deviceName, forKey: Keys.deviceName) } }
     @Published public var forcesRelay: Bool { didSet { defaults.set(forcesRelay, forKey: Keys.forcesRelay) } }
     @Published public var allowsControl: Bool {
@@ -83,6 +95,8 @@ public final class BridgeModel: ObservableObject {
     }
     /// A scanned pairing code kept until the server it came with answers.
     private var codeAwaitingServer: String?
+    /// A pairing link for another server, kept until the switch is confirmed or cancelled.
+    private var linkAwaitingConfirm: PairingLink?
     /// Who controlled this Mac and when, newest first.
     @Published public private(set) var sessionLog: [SessionLogEntry] = []
     @Published public private(set) var controllerStatus: ControllerStatus = .idle
@@ -145,8 +159,15 @@ public final class BridgeModel: ObservableObject {
         lidClosedMode = defaults.string(forKey: Keys.lidClosedMode).flatMap(LidClosedMode.init) ?? .off
         self.defaults = defaults
         self.secrets = secrets
-        serverURL = defaults.string(forKey: Keys.serverURL) ?? ""
-        accessToken = secrets.accessToken()
+        let server = defaults.string(forKey: Keys.serverURL) ?? ""
+        serverURL = server
+        // Before tokens were kept per server there was one; it belongs to the server saved then.
+        let key = Self.serverKey(server)
+        if !key.isEmpty, secrets.token(key).isEmpty, !secrets.token("").isEmpty {
+            secrets.setToken(secrets.token(""), key)
+            secrets.setToken("", "")
+        }
+        accessToken = secrets.token(key)
         deviceName = defaults.string(forKey: Keys.deviceName) ?? Self.defaultDeviceName()
         forcesRelay = defaults.bool(forKey: Keys.forcesRelay)
         allowsControl = defaults.bool(forKey: Keys.allowsControl)
@@ -388,15 +409,50 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
-    /// Pairs from a scanned or opened pairing link. With no server set yet, or offline,
-    /// it takes the link's server, goes online and pairs once the server answers.
+    /// Pairs from a scanned or opened pairing link. With no server set yet it takes the
+    /// link's server; another server than the one set waits for `confirmServerSwitch()`.
+    /// Offline, it goes online and pairs once the server answers.
     public func pair(using link: PairingLink) {
-        if let server = link.server, Self.parseServerURL(server) != parsedServerURL {
+        if let server = link.server, Self.serverKey(server) != Self.serverKey(serverURL) {
+            if canGoOnline {
+                // A link can come from anyone: ask before leaving the server the user chose.
+                guard !inSession else {
+                    pairingStatus = .failed("End the current session before pairing with another server.")
+                    return
+                }
+                cancelPairing()
+                linkAwaitingConfirm = link
+                pairingStatus = .confirmServer(server)
+                return
+            }
+            // First-time setup: the link's server becomes this device's server.
             serverURL = server
             goOnline()
         } else if signalingStatus == .offline, canGoOnline {
             goOnline()
         }
+        continuePairing(link)
+    }
+
+    /// Switches to the server of the link waiting in `.confirmServer`, with that server's own
+    /// token (none if it is new), and pairs.
+    public func confirmServerSwitch() {
+        guard let link = linkAwaitingConfirm, let server = link.server else { return }
+        linkAwaitingConfirm = nil
+        guard !inSession else {
+            pairingStatus = .failed("End the current session before pairing with another server.")
+            return
+        }
+        switchingByLink = true
+        serverURL = server
+        switchingByLink = false
+        goOnline()
+        continuePairing(link)
+    }
+
+    private var inSession: Bool { controllerPeer != nil || hostPeer != nil }
+
+    private func continuePairing(_ link: PairingLink) {
         guard canGoOnline else {
             pairingStatus = .failed("Set the server in Settings first, then scan again.")
             return
@@ -439,12 +495,32 @@ public final class BridgeModel: ObservableObject {
         shownCode = nil
         typedCode = nil
         codeAwaitingServer = nil
+        linkAwaitingConfirm = nil
         pairingStatus = .idle
+    }
+
+    /// Keeps each server's token with that server. A confirmed link loads the new server's
+    /// own token, empty if it has none. An edit in Settings loads the new server's token if it
+    /// has one, otherwise the token being shown moves with the edit (typing the address goes
+    /// through many partial ones; the user is changing where this token goes).
+    private func serverChanged(from old: String) {
+        let oldKey = Self.serverKey(old), newKey = Self.serverKey(serverURL)
+        guard oldKey != newKey else { return }
+        let stored = secrets.token(newKey)
+        if switchingByLink || !stored.isEmpty {
+            accessToken = stored
+        } else {
+            let carried = accessToken
+            accessToken = carried
+            secrets.setToken("", oldKey)
+        }
     }
 
     /// Takes away that device's right to control this Mac.
     public func revokeControl(from device: PairedDevice) {
         if device.id == hostPeer?.id { endHosting(notify: true) }
+        // A question still showing must not let it in after all.
+        if device.id == pendingRequest?.peer.id { declineRequest() }
         update(device.id) { $0.mayControlThisMac = false }
     }
 
@@ -692,7 +768,10 @@ public final class BridgeModel: ObservableObject {
     }
 
     private func beginHosting(for peer: PairedDevice) async {
-        guard allowsControl else { return send(.bye, to: peer) }
+        // Looked up again: the right may have been taken away since the request came in.
+        guard allowsControl, paired.first(where: { $0.id == peer.id })?.mayControlThisMac == true else {
+            return send(.bye, to: peer)
+        }
         refreshPermissions()
         guard hasScreenPermission else {
             notice = "\(peer.name) tried to connect, but Screen Recording is not allowed for MacBridge."
@@ -982,6 +1061,17 @@ public final class BridgeModel: ObservableObject {
         return url
     }
 
+    /// The form of a server address that tokens are kept under: scheme, host, port and
+    /// path, without case or a trailing slash. Empty for no valid server.
+    nonisolated public static func serverKey(_ text: String) -> String {
+        guard let url = parseServerURL(text), let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased()
+        else { return "" }
+        let port = url.port.map { ":\($0)" } ?? ""
+        var path = url.path
+        while path.hasSuffix("/") { path.removeLast() }
+        return "\(scheme)://\(host)\(port)\(path)"
+    }
+
     /// The computer's name reduced to plain characters.
     nonisolated public static func defaultDeviceName(from hostName: String? = BridgeModel.systemDeviceName) -> String {
         let cleaned = (hostName ?? "")
@@ -1015,29 +1105,38 @@ public final class BridgeModel: ObservableObject {
     }
 }
 
-/// Where the access token is kept. The app uses the keychain; tests use memory.
+/// Where access tokens are kept, one per server key (`BridgeModel.serverKey`). The key ""
+/// holds a token not yet tied to a server, and the single token of older versions.
+/// The app uses the keychain; tests use memory.
 public struct SecretStore: Sendable {
-    public var accessToken: @Sendable () -> String
-    public var setAccessToken: @Sendable (String) -> Void
+    public var token: @Sendable (_ server: String) -> String
+    public var setToken: @Sendable (_ token: String, _ server: String) -> Void
 
     public static let keychain = SecretStore(
-        accessToken: { Keychain.read("access-token").flatMap { String(data: $0, encoding: .utf8) } ?? "" },
-        setAccessToken: { token in
-            if token.isEmpty { Keychain.delete("access-token") } else { Keychain.write(Data(token.utf8), to: "access-token") }
+        token: { server in Keychain.read(account(server)).flatMap { String(data: $0, encoding: .utf8) } ?? "" },
+        setToken: { token, server in
+            if token.isEmpty { Keychain.delete(account(server)) } else { Keychain.write(Data(token.utf8), to: account(server)) }
         }
     )
 
+    /// "access-token" is the account older versions used for their one token.
+    private static func account(_ server: String) -> String {
+        server.isEmpty ? "access-token" : "access-token \(server)"
+    }
+
+    /// `initial` is the token not yet tied to a server.
     public static func inMemory(_ initial: String = "") -> SecretStore {
-        let box = TokenBox(initial)
-        return SecretStore(accessToken: { box.value }, setAccessToken: { box.value = $0 })
+        let box = TokenBox(initial.isEmpty ? [:] : ["": initial])
+        return SecretStore(token: { box.value[$0] ?? "" },
+                           setToken: { token, server in box.value[server] = token.isEmpty ? nil : token })
     }
 }
 
 private final class TokenBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var _value: String
-    init(_ value: String) { _value = value }
-    var value: String {
+    private var _value: [String: String]
+    init(_ value: [String: String]) { _value = value }
+    var value: [String: String] {
         get { lock.withLock { _value } }
         set { lock.withLock { _value = newValue } }
     }

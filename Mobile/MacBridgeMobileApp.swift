@@ -41,6 +41,15 @@ struct RootScreen: View {
     /// A session that iOS ended by putting the app in the background.
     @State private var interrupted: PairedDevice?
 
+    private var confirmServer: String? {
+        if case let .confirmServer(server) = model.pairingStatus { return server }
+        return nil
+    }
+
+    private var confirmServerHost: String {
+        confirmServer.map { URL(string: $0)?.host ?? $0 } ?? ""
+    }
+
     var body: some View {
         Group {
             switch model.controllerStatus {
@@ -81,6 +90,14 @@ struct RootScreen: View {
             Button("Not now", role: .cancel) { interrupted = nil }
         } message: {
             Text("The session with \(interrupted.map(model.displayName) ?? "the Mac") ended when MacBridge went to the background.")
+        }
+        // A pairing link may come from anyone: switching to the server it names needs a yes.
+        .alert("Use another server?", isPresented: Binding(get: { confirmServer != nil }, set: { _ in })) {
+            // Each button settles the status, which closes the alert.
+            Button("Use \(confirmServerHost)") { model.confirmServerSwitch() }
+            Button("Cancel", role: .cancel) { model.cancelPairing() }
+        } message: {
+            Text("This pairing code is for the server \(confirmServerHost), not the one set in Settings. Switch only if you trust it. Your access token stays with the current server.")
         }
     }
 }

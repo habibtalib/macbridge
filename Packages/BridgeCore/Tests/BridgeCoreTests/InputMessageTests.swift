@@ -42,6 +42,14 @@ import Testing
         #expect(decoded == .mouseMove(x: 0, y: 1))
     }
 
+    @Test func rejectsClipboardTextOverTheLimit() throws {
+        let limit = String(repeating: "x", count: InputMessage.maxClipboardBytes)
+        #expect(try InputMessage(decoding: InputMessage.clipboard(text: limit).encoded()) == .clipboard(text: limit))
+        #expect(throws: InputMessageError.tooLong) {
+            try InputMessage(decoding: InputMessage.clipboard(text: limit + "x").encoded())
+        }
+    }
+
     @Test func rejectsNonFiniteValues() {
         #expect(throws: InputMessageError.invalidCoordinate) {
             try InputMessage(decoding: InputMessage.mouseMove(x: .nan, y: 0).encoded())
