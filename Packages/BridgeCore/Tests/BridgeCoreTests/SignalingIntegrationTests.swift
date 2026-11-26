@@ -114,8 +114,11 @@ struct SignalingIntegrationTests {
         try await poll("first online") { firstInbox.status == .online }
         second.connect()
         try await poll("second online") { secondInbox.status == .online }
+        // Both were just online, so each takes the first push-off for its own late login and
+        // comes back once. The second push-off settles it: the first stays off.
         try await poll("first told") { firstInbox.errors == [.replaced] }
         try await poll("first gives up") { firstInbox.status == .offline }
+        try await poll("second back") { secondInbox.status == .online }
         // No tug of war: the first stays off and the second stays on.
         try await Task.sleep(for: .seconds(2))
         #expect(firstInbox.status == .offline)
@@ -159,6 +162,46 @@ struct SignalingIntegrationTests {
         asker.presence(of: [ids[0]]) { later.record($0) }
         try await poll("later answer") { later.values.count == 1 }
         #expect(later.values == [[]])
+    }
+
+    @Test func aReplacedCloseIsAnotherCopyOnlyWhenItCannotBeOurOwn() {
+        // A settled connection pushed off: another copy.
+        #expect(SignalingClient.isReplaced(onlineFor: 60, abandonedLoginFor: nil, excusedBefore: 0))
+        // Just logged in, or not even welcomed: maybe our own older login finishing late.
+        #expect(!SignalingClient.isReplaced(onlineFor: 1, abandonedLoginFor: nil, excusedBefore: 0))
+        #expect(!SignalingClient.isReplaced(onlineFor: nil, abandonedLoginFor: nil, excusedBefore: 0))
+        // A login dropped halfway a moment ago: the server may finish it after the new one.
+        #expect(!SignalingClient.isReplaced(onlineFor: 60, abandonedLoginFor: 10, excusedBefore: 0))
+        #expect(SignalingClient.isReplaced(onlineFor: 60, abandonedLoginFor: 45, excusedBefore: 0))
+        // A second one in a row is never excused.
+        #expect(SignalingClient.isReplaced(onlineFor: 1, abandonedLoginFor: 10, excusedBefore: 1))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func checkingTheConnectionOftenKeepsOnePingChain() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let client = SignalingClient(url: server.url, identity: Identity(), accessToken: LocalServer.token)
+        client.pingInterval = 0.3
+        let pings = Answers()
+        client.onPing = { pings.record(nil) }
+        defer { client.disconnect() }
+        let inbox = Inbox()
+        inbox.attach(to: client)
+        client.connect()
+        try await poll("online") { inbox.status == .online }
+        // Each wake or return to the front checks the connection with a ping of its own.
+        for _ in 0..<8 {
+            client.reconnectIfStale()
+            try await Task.sleep(for: .milliseconds(60))
+        }
+        let before = pings.values.count
+        try await Task.sleep(for: .seconds(1.5))
+        let during = pings.values.count - before
+        // One chain pings about 5 times in 1.5 s; a chain per check would be about 40.
+        #expect(during <= 7)
+        #expect(during >= 3)
+        #expect(inbox.status == .online)
     }
 
     @Test func aByeReasonTravelsAndAnUnknownOneIsIgnored() throws {

@@ -118,8 +118,24 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     /// The ping waiting for its pong.
     private var pingNumber = 0
     private var awaitedPing: Int?
+    /// The next scheduled ping: one chain per connection, however often a ping is asked for.
+    private var nextPing: DispatchWorkItem?
+    /// Called on `queue` for each ping sent. For tests.
+    var onPing: (() -> Void)?
+    /// The task that has sent its login but not yet been welcomed.
+    private var loggingIn: URLSessionWebSocketTask?
+    /// When a task was dropped halfway through its login: the server may still finish that
+    /// login after the next one, and then pushes the next one off with "replaced".
+    private var abandonedLoginAt: Date?
+    private var onlineSince: Date?
+    /// "Replaced" close codes put down to our own reconnects, since the last steady connection.
+    private var excusedReplacements = 0
+    /// The task whose "replaced" close was already weighed, so its late delegate call is not a repeat.
+    private var replacementWeighed: URLSessionWebSocketTask?
+    /// How long `droppedTask` had been online, for a close code that arrives after the drop.
+    private var droppedOnlineFor: TimeInterval?
     private var pathMonitor: NWPathMonitor?
-    private var lastPath: (satisfied: Bool, interfaces: [String])?
+    private var lastPath: (satisfied: Bool, interfaces: Set<String>)?
 
     public init(url: URL, identity: Identity, accessToken: String? = nil) {
         self.url = url
@@ -145,14 +161,16 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     /// anything having said so. Online, a ping checks it now; otherwise it reconnects now,
     /// without waiting out the backoff.
     public func reconnectIfStale() {
-        queue.async {
-            guard self.wantsConnection else { return }
-            self.attempt = 0
-            if let task = self.task, self.status == .online {
-                self.ping(task)
-            } else {
-                self.reconnectNow()
-            }
+        queue.async { self.checkOrReconnect() }
+    }
+
+    private func checkOrReconnect() {
+        guard wantsConnection else { return }
+        attempt = 0
+        if let task, status == .online {
+            ping(task)
+        } else {
+            reconnectNow()
         }
     }
 
@@ -254,7 +272,15 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     private func discard(_ task: URLSessionWebSocketTask) {
         if task === self.task { self.task = nil }
         droppedTask = task
+        droppedOnlineFor = onlineSince.map { Date().timeIntervalSince($0) }
+        if task === loggingIn {
+            loggingIn = nil
+            abandonedLoginAt = Date()
+        }
+        onlineSince = nil
         awaitedPing = nil
+        nextPing?.cancel()
+        nextPing = nil
         task.cancel(with: .goingAway, reason: nil)
         flushIceWaiters()
         flushPresenceWaiters()
@@ -286,9 +312,13 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
 
     private func dropped(_ task: URLSessionWebSocketTask, closeCode: Int? = nil) {
         guard task === self.task else { return }
+        let onlineFor = onlineSince.map { Date().timeIntervalSince($0) }
         discard(task)
         guard wantsConnection else { return set(.offline) }
-        if (closeCode ?? task.closeCode.rawValue) == Self.replacedCloseCode { return replaced() }
+        if (closeCode ?? task.closeCode.rawValue) == Self.replacedCloseCode {
+            replacementWeighed = task
+            if isReplaced(onlineFor: onlineFor) { return replaced() }
+        }
         set(.connecting)
         attempt += 1
         let delay = min(30, pow(2, Double(attempt - 1)))
@@ -296,6 +326,26 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             guard self.wantsConnection, self.task == nil else { return }
             self.open()
         }
+    }
+
+    /// Decides whether a "replaced" close means another copy, and counts the ones excused.
+    private func isReplaced(onlineFor: TimeInterval?) -> Bool {
+        let abandonedFor = abandonedLoginAt.map { Date().timeIntervalSince($0) }
+        if Self.isReplaced(onlineFor: onlineFor, abandonedLoginFor: abandonedFor, excusedBefore: excusedReplacements) {
+            return true
+        }
+        excusedReplacements += 1
+        return false
+    }
+
+    /// A "replaced" close soon after we dropped a half-finished login, or soon after logging in,
+    /// may be our own older login finishing late: reconnect once. A second one in a row, or one
+    /// on a connection that had settled, is another copy.
+    static func isReplaced(onlineFor: TimeInterval?, abandonedLoginFor: TimeInterval?, excusedBefore: Int) -> Bool {
+        if excusedBefore > 0 { return true }
+        if let abandonedLoginFor, abandonedLoginFor < 30 { return false }
+        guard let onlineFor else { return false } // not even welcomed yet
+        return onlineFor >= 5
     }
 
     /// Another copy logged in with this identity. Reconnecting would push it off in turn.
@@ -307,10 +357,13 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     // MARK: Keepalive and network changes
 
     private func schedulePing(_ task: URLSessionWebSocketTask) {
-        queue.asyncAfter(deadline: .now() + pingInterval) {
-            guard task === self.task, self.status == .online, self.awaitedPing == nil else { return }
+        nextPing?.cancel()
+        let work = DispatchWorkItem { [weak self, weak task] in
+            guard let self, let task, task === self.task, self.status == .online, self.awaitedPing == nil else { return }
             self.ping(task)
         }
+        nextPing = work
+        queue.asyncAfter(deadline: .now() + pingInterval, execute: work)
     }
 
     /// A socket can die without a close (sleep, a network that went away): no pong in time
@@ -320,12 +373,18 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         pingNumber += 1
         let number = pingNumber
         awaitedPing = number
+        onPing?()
         task.sendPing { [weak self] error in
             guard let self else { return }
             self.queue.async {
                 guard task === self.task, self.awaitedPing == number else { return }
                 if error != nil { return self.dropped(task) }
                 self.awaitedPing = nil
+                // Answered a full interval after login: the connection has settled.
+                if let since = self.onlineSince, Date().timeIntervalSince(since) >= self.pingInterval {
+                    self.excusedReplacements = 0
+                    self.abandonedLoginAt = nil
+                }
                 self.schedulePing(task)
             }
         }
@@ -343,13 +402,19 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         pathMonitor = monitor
     }
 
-    /// Back on a network, or on another one: the old socket is likely dead or about to be,
-    /// and waiting out the backoff or a ping would only leave the device unreachable longer.
+    /// Back on a network: the old socket is dead, so reconnect at once instead of waiting out
+    /// the backoff. Other interfaces (another network, a VPN coming up, a new order) may or may
+    /// not have broken it: online, a ping checks first.
     private func pathChanged(_ path: NWPath) {
-        let now = (satisfied: path.status == .satisfied, interfaces: path.availableInterfaces.map(\.name))
+        let now = (satisfied: path.status == .satisfied, interfaces: Set(path.availableInterfaces.map(\.name)))
         defer { lastPath = now }
         guard let last = lastPath, wantsConnection, now.satisfied else { return }
-        if !last.satisfied || last.interfaces != now.interfaces { reconnectNow() }
+        if !last.satisfied {
+            attempt = 0
+            reconnectNow()
+        } else if last.interfaces != now.interfaces {
+            checkOrReconnect()
+        }
     }
 
     private func handle(_ message: URLSessionWebSocketTask.Message, on task: URLSessionWebSocketTask) {
@@ -363,9 +428,12 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         switch incoming {
         case let .challenge(nonce):
             let message = Data("macbridge-auth-v1|\(identity.deviceID)|\(nonce)".utf8)
+            loggingIn = task
             write(.auth(signature: identity.sign(message)), on: task)
         case .welcome:
             attempt = 0
+            if loggingIn === task { loggingIn = nil }
+            onlineSince = Date()
             set(.online)
             schedulePing(task)
         case let .signal(from, envelope):
@@ -443,8 +511,10 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             // The receive may have failed first and dropped the task already; the code still counts
             // while no newer connection has opened.
             if closeCode.rawValue == Self.replacedCloseCode, self.wantsConnection,
-               self.task == nil, webSocketTask === self.droppedTask {
-                return self.replaced()
+               self.task == nil, webSocketTask === self.droppedTask, webSocketTask !== self.replacementWeighed {
+                self.replacementWeighed = webSocketTask
+                if self.isReplaced(onlineFor: self.droppedOnlineFor) { self.replaced() }
+                return
             }
             self.dropped(webSocketTask, closeCode: closeCode.rawValue)
         }

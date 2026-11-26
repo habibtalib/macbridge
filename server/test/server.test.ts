@@ -468,6 +468,30 @@ describe("limits", () => {
     await Device.online();
   });
 
+  it("survives a refused client that resets while being refused", async () => {
+    await start({ limits: { maxConnectionsPerIp: 1 } });
+    await Device.online();
+    // Resets right after the request or on the first byte of the 503 land while the server is
+    // still writing it. It does not hit the race every run; enough tries usually do.
+    const resets = Array.from({ length: 200 }, (_, i) =>
+      new Promise<void>((resolve) => {
+        const tcp = connect(server.port, "127.0.0.1", () => {
+          tcp.write(
+            "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+          );
+          if (i % 2) tcp.once("data", () => tcp.resetAndDestroy());
+          else setImmediate(() => tcp.resetAndDestroy());
+          resolve();
+        });
+        tcp.on("error", () => {});
+      }),
+    );
+    await Promise.all(resets);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await attempt()).toBe(503); // still serving, and still counting
+  });
+
   it("counts the address the proxy names when told to trust it", async () => {
     await start({ limits: { maxConnectionsPerIp: 1 }, trustProxy: true });
     const from = (ip: string) => ({ "x-forwarded-for": `198.51.100.9, ${ip}` });
@@ -482,5 +506,13 @@ describe("limits", () => {
     expect(await attempt({ "x-forwarded-for": "spoofed, 203.0.113.1, 10.0.0.2" })).toBe("open");
     expect(await attempt({ "x-forwarded-for": "other, 203.0.113.1, 10.0.0.2" })).toBe(503);
     expect(await attempt({ "x-forwarded-for": "203.0.113.1, 203.0.113.3, 10.0.0.2" })).toBe("open");
+  });
+
+  it("counts the direct address when the header names fewer entries than proxies", async () => {
+    await start({ limits: { maxConnectionsPerIp: 1 }, trustProxy: true, trustProxyHops: 2 });
+    expect(await attempt({ "x-forwarded-for": "203.0.113.1" })).toBe("open");
+    // A different single entry is not a different client: both come from 127.0.0.1.
+    expect(await attempt({ "x-forwarded-for": "203.0.113.2" })).toBe(503);
+    expect(await attempt()).toBe(503);
   });
 });

@@ -100,11 +100,15 @@ public final class BridgeModel: ObservableObject {
             if signalingStatus == .online, let host = hostAwaitingServer {
                 connect(to: host)
             }
+            // The server forgets a pairing code when the connection drops: show it to the new one.
+            if signalingStatus == .online, let code = shownCode {
+                signaling?.openPairing(tag: code.tag)
+            }
         }
     }
     /// A Mac to connect to once the server answers: asked for while the connection was still
     /// coming back (an iPhone back from the background, a Mac back from sleep).
-    private var hostAwaitingServer: PairedDevice?
+    private(set) var hostAwaitingServer: PairedDevice?
     private var hostAwaitingTimeout: Task<Void, Never>?
     /// A scanned pairing code kept until the server it came with answers.
     private var codeAwaitingServer: String?
@@ -229,10 +233,15 @@ public final class BridgeModel: ObservableObject {
     public func resumeConnection() {
         if let signaling {
             signaling.reconnectIfStale()
-        } else if signalingStatus == .offline, canGoOnline {
+        } else if !staysOffline, signalingStatus == .offline, canGoOnline {
             goOnline()
         }
     }
+
+    /// Offline on purpose (Go offline) or because the server turned this device away (wrong
+    /// token, another copy online): coming back to the front must not go online again by itself.
+    /// Cleared by going online or changing the connection settings.
+    private(set) var staysOffline = false
 
     /// While this Mac accepts control and is meant to be online, it must not
     /// fall asleep, or it would drop off the server.
@@ -340,6 +349,7 @@ public final class BridgeModel: ObservableObject {
     /// any existing connection.
     public func goOnline() {
         goOffline()
+        staysOffline = false
         guard let url = parsedServerURL else { return }
         let client = SignalingClient(url: url, identity: identity, accessToken: accessToken)
         // Callbacks queued by a client that has since been replaced (going offline, another
@@ -370,6 +380,7 @@ public final class BridgeModel: ObservableObject {
     }
 
     public func goOffline() {
+        staysOffline = true
         cancelWaitingConnect()
         disconnect()
         endHosting(notify: true)
@@ -422,6 +433,8 @@ public final class BridgeModel: ObservableObject {
                 let refused = remoteVideo == nil
                 endControlling(.failed(refused ? "\(displayName(peer)) did not accept the connection" : "\(displayName(peer)) ended the session"))
             } else {
+                // The host answered: the call is alive, give it a full timeout again.
+                if case let .calling(host) = controllerStatus, host.id == peer.id { startCallTimer(for: host) }
                 controllerSession?.handle(payload)
             }
             return
@@ -459,12 +472,16 @@ public final class BridgeModel: ObservableObject {
             failPairing("No Mac is showing that code. Check it and try again.")
         case let .unauthorized(code):
             // The client has stopped for good: let go of it, and of the wake lock held for it.
+            cancelWaitingConnect()
+            staysOffline = true
             signaling = nil
             signalingStatus = .offline
             notice = code == "bad-token"
                 ? "The server refused the access token."
                 : "The server refused this device (\(code))."
         case .replaced:
+            cancelWaitingConnect()
+            staysOffline = true
             signaling = nil
             signalingStatus = .offline
             #if os(macOS)
@@ -616,10 +633,23 @@ public final class BridgeModel: ObservableObject {
 
     /// Applies the Settings connection fields once they are committed (submit, leaving the
     /// field, Go online), not on every keystroke. `token` nil: the token field was not edited,
-    /// so the server's own token is loaded.
-    public func applyConnectionSettings(server: String, token: String?) {
-        if server != serverURL { serverURL = server }
-        if let token, token != accessToken { accessToken = token }
+    /// so the server's own token is loaded. `loadedServer`: the server the fields were filled
+    /// from. When the server field was not edited but the server changed meanwhile (a confirmed
+    /// pairing link), the server stays and a token typed goes to the server it was typed for.
+    public func applyConnectionSettings(server: String, token: String?, loadedServer: String? = nil) {
+        let serverEdited = loadedServer.map { Self.serverKey($0) != Self.serverKey(server) } ?? true
+        if serverEdited, server != serverURL {
+            serverURL = server
+            staysOffline = false // new settings may fix what kept it offline
+        }
+        guard let token else { return }
+        staysOffline = false
+        let target = serverEdited ? server : (loadedServer ?? server)
+        if Self.serverKey(target) == Self.serverKey(serverURL) {
+            if token != accessToken { accessToken = token }
+        } else {
+            secrets.setToken(token, Self.serverKey(target))
+        }
     }
 
     /// Takes away that device's right to control this Mac.
@@ -705,13 +735,7 @@ public final class BridgeModel: ObservableObject {
         controllerPeer = host
         lastHost = host
         controllerStatus = .calling(host)
-        let timeout = callTimeout
-        callTimer = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            guard !Task.isCancelled, let self, case let .calling(calling) = self.controllerStatus, calling.id == host.id else { return }
-            self.send(.bye, to: host)
-            self.endControlling(.failed("No answer from \(self.displayName(host)). Check that it is awake, online and allows control."))
-        }
+        startCallTimer(for: host)
         Task {
             let servers = await iceServers()
             guard controllerPeer == host, controllerSession == nil else { return } // cancelled meanwhile
@@ -740,9 +764,22 @@ public final class BridgeModel: ObservableObject {
         hostAwaitingServer = nil
     }
 
-    /// A call the host has not answered by then fails. Internal so tests can shorten it.
-    var callTimeout: TimeInterval = 25
+    /// A call the host has not answered by then fails. Longer than a host set to "ask first"
+    /// waits for its answer, plus time to set up the connection; each sign of life from the
+    /// host (offer, candidate) starts it again. Internal so tests can shorten it.
+    var callTimeout: TimeInterval = 45
     private var callTimer: Task<Void, Never>?
+
+    private func startCallTimer(for host: PairedDevice) {
+        callTimer?.cancel()
+        let timeout = callTimeout
+        callTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled, let self, case let .calling(calling) = self.controllerStatus, calling.id == host.id else { return }
+            self.send(.bye, to: host)
+            self.endControlling(.failed("No answer from \(self.displayName(host)). Check that it is awake, online and allows control."))
+        }
+    }
 
     /// What the controller shows when the host turns a request away.
     nonisolated static func refusal(_ reason: ByeReason, from name: String) -> String {

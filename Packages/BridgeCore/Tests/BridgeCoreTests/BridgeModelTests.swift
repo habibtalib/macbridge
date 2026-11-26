@@ -361,6 +361,29 @@ struct BridgeModelTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aHostThatAnswersKeepsTheCallAlive() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (laptop, _, standIn, received) = try await laptopCallingAStandIn(server)
+        defer { laptop.goOffline(); standIn.disconnect() }
+        #expect(laptop.callTimeout > laptop.askTimeout) // a host asking first is not given up on
+        laptop.callTimeout = 0.8
+        laptop.connect(to: try #require(laptop.controllable.first))
+        try await poll("request arrives") { received.payloads == [.request] }
+        let candidate = SignalPayload.candidate(sdp: "candidate:1 1 udp 1 10.0.0.1 5000 typ host", mLineIndex: 0, mid: "0")
+        for _ in 0..<3 {
+            try await Task.sleep(for: .milliseconds(500))
+            standIn.send(SignalEnvelope(candidate), to: laptop.deviceID)
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        // 1.8 s in, past the timeout, but the host spoke 0.3 s ago.
+        if case .calling = laptop.controllerStatus {} else { Issue.record("gave up on a host that answers: \(laptop.controllerStatus)") }
+        try await poll("gives up once the host is silent") {
+            laptop.controllerStatus == .failed("No answer from Studio. Check that it is awake, online and allows control.")
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aRefusalSaysWhy() async throws {
         let server = try await LocalServer.start()
         defer { server.stop() }
@@ -467,6 +490,103 @@ struct BridgeModelTests {
         #expect(phone.pairingStatus == .idle)
         try await Task.sleep(for: .milliseconds(100))
         #expect(phone.pairingStatus == .idle)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aShownCodeSurvivesAReconnect() async throws {
+        var server = try await LocalServer.start()
+        let studio = makeModel("Studio", server: server), laptop = makeModel("Laptop", server: server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.goOnline()
+        try await poll("studio online") { studio.signalingStatus == .online }
+        studio.showPairingCode()
+        let code = try #require(shownCode(studio))
+
+        server.stop()
+        try await poll("studio notices") { studio.signalingStatus != .online }
+        server = try await LocalServer.start(port: server.port)
+        defer { server.stop() }
+        try await poll("studio back") { studio.signalingStatus == .online }
+        #expect(shownCode(studio) == code)
+
+        laptop.goOnline()
+        try await poll("laptop online") { laptop.signalingStatus == .online }
+        try await Task.sleep(for: .milliseconds(200))
+        laptop.pair(usingCode: code)
+        try await poll("paired with the code shown before the drop") { studio.paired.count == 1 && laptop.paired.count == 1 }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func comingBackToTheFrontRespectsGoingOffline() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let phone = makeModel("Phone", server: server)
+        defer { phone.goOffline() }
+        phone.resumeConnection() // never told to stay off: goes online
+        try await poll("online") { phone.signalingStatus == .online }
+
+        phone.goOffline()
+        phone.resumeConnection()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(phone.signalingStatus == .offline)
+
+        // Closing Settings without a change keeps it off; a change lets it come back.
+        phone.applyConnectionSettings(server: phone.serverURL, token: nil, loadedServer: phone.serverURL)
+        phone.resumeConnection()
+        #expect(phone.signalingStatus == .offline)
+        phone.applyConnectionSettings(server: phone.serverURL, token: LocalServer.token + "x", loadedServer: phone.serverURL)
+        phone.applyConnectionSettings(server: phone.serverURL, token: LocalServer.token, loadedServer: phone.serverURL)
+        phone.resumeConnection()
+        try await poll("online again") { phone.signalingStatus == .online }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRefusedLoginStaysOffAndDropsAWaitingConnect() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let mac = PairedDevice(id: Identity().deviceID, publicKey: Data(repeating: 7, count: 32), name: "Studio",
+                               thisMacMayControl: true)
+        defaults.set(try JSONEncoder().encode([mac]), forKey: "pairedDevices")
+        let phone = BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory("not-the-token"))
+        phone.serverURL = server.url.absoluteString
+        defer { phone.goOffline() }
+
+        phone.connect(to: mac) // offline: goes online and connects once the server answers
+        #expect(phone.hostAwaitingServer == mac)
+        try await poll("refused") { phone.notice == "The server refused the access token." }
+        #expect(phone.hostAwaitingServer == nil) // its "server did not answer" must not follow
+        phone.resumeConnection()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(phone.signalingStatus == .offline)
+        #expect(phone.notice == "The server refused the access token.")
+    }
+
+    @Test func aTokenTypedForOneServerStaysWithIt() {
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let secrets = SecretStore.inMemory()
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets)
+        model.applyConnectionSettings(server: "wss://a.example.com", token: "token-a")
+        #expect(secrets.token("wss://a.example.com") == "token-a")
+
+        // Settings was filled for A; a pairing link switched to C while a new token was typed.
+        model.serverURL = "wss://c.example.com"
+        let cToken = secrets.token("wss://c.example.com")
+        model.applyConnectionSettings(server: "wss://a.example.com", token: "token-a2", loadedServer: "wss://a.example.com")
+        #expect(model.serverURL == "wss://c.example.com") // the switch is not undone
+        #expect(secrets.token("wss://a.example.com") == "token-a2")
+        #expect(secrets.token("wss://c.example.com") == cToken)
+
+        // Server and token edited together: the token goes to the new server, the old keeps its own.
+        model.applyConnectionSettings(server: "wss://b.example.com", token: "token-b", loadedServer: "wss://c.example.com")
+        #expect(model.serverURL == "wss://b.example.com")
+        #expect(secrets.token("wss://b.example.com") == "token-b")
+        #expect(secrets.token("wss://c.example.com") == cToken)
+        #expect(secrets.token("wss://a.example.com") == "token-a2")
     }
 
     /// A model with a token but no server yet, as on first launch.

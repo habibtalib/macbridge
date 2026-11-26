@@ -198,12 +198,17 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
       .map((entry) => entry.trim())
       .filter(Boolean);
     const hops = Math.max(1, options.trustProxyHops ?? 1);
-    return entries[entries.length - hops] ?? entries[0] ?? direct;
+    // Fewer entries than proxies: the header did not come through all of them, so no entry is
+    // trustworthy. entries[0] would be whatever the client wrote.
+    return entries.length >= hops ? (entries[entries.length - hops] ?? direct) : direct;
   };
 
   // Limits are checked before the WebSocket exists, so a refused connection never holds a
   // slot, whatever its client does next. A slot is freed when the TCP connection closes.
   http.on("upgrade", (request, tcp, head) => {
+    // Until ws takes the socket over, nothing else listens for its errors: a client resetting
+    // while the 503 is written would otherwise crash the process.
+    tcp.on("error", () => tcp.destroy());
     const ip = clientAddress(request);
     if (connections >= limits.maxConnections || (perIp.get(ip) ?? 0) >= limits.maxConnectionsPerIp) {
       tcp.once("finish", () => tcp.destroy());

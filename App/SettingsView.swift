@@ -165,6 +165,8 @@ private struct ConnectionSettings: View {
     @State private var serverDraft = ""
     @State private var tokenDraft = ""
     @State private var tokenLoaded = ""
+    /// The server the fields were filled from: a token typed belongs to it.
+    @State private var serverLoaded = ""
     @FocusState private var focused: Field?
     private enum Field { case server, token }
 
@@ -210,12 +212,14 @@ private struct ConnectionSettings: View {
 
     private func load() {
         serverDraft = model.serverURL
+        serverLoaded = model.serverURL
         tokenDraft = model.accessToken
         tokenLoaded = model.accessToken
     }
 
     private func commit() {
-        model.applyConnectionSettings(server: serverDraft, token: tokenDraft == tokenLoaded ? nil : tokenDraft)
+        model.applyConnectionSettings(server: serverDraft, token: tokenDraft == tokenLoaded ? nil : tokenDraft,
+                                      loadedServer: serverLoaded)
         load()
     }
 
