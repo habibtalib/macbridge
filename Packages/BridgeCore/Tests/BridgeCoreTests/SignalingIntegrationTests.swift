@@ -76,6 +76,107 @@ struct SignalingIntegrationTests {
         defer { server.stop() }
         try await poll("back online") { inbox.status == .online }
     }
+
+    @Test(.timeLimit(.minutes(1)))
+    func anUnansweredPingCountsAsADrop() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let client = SignalingClient(url: server.url, identity: Identity(), accessToken: LocalServer.token)
+        client.pingInterval = 0.2
+        client.pingTimeout = 0.5
+        defer { client.disconnect() }
+        let inbox = Inbox()
+        inbox.attach(to: client)
+        client.connect()
+        try await poll("online") { inbox.status == .online }
+        try await Task.sleep(for: .seconds(1))
+        #expect(inbox.status == .online) // answered pings keep it online
+
+        // A frozen server keeps the socket open but answers nothing, like a dead network.
+        server.process.suspend()
+        try await poll("notices the silence") { inbox.status == .connecting }
+        server.process.resume()
+        try await poll("back online") { inbox.status == .online }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSecondCopyWithTheSameKeyStopsTheFirst() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let identity = Identity()
+        let first = SignalingClient(url: server.url, identity: identity, accessToken: LocalServer.token)
+        let second = SignalingClient(url: server.url, identity: identity, accessToken: LocalServer.token)
+        defer { first.disconnect(); second.disconnect() }
+        let firstInbox = Inbox(), secondInbox = Inbox()
+        firstInbox.attach(to: first)
+        secondInbox.attach(to: second)
+        first.connect()
+        try await poll("first online") { firstInbox.status == .online }
+        second.connect()
+        try await poll("second online") { secondInbox.status == .online }
+        try await poll("first told") { firstInbox.errors == [.replaced] }
+        try await poll("first gives up") { firstInbox.status == .offline }
+        // No tug of war: the first stays off and the second stays on.
+        try await Task.sleep(for: .seconds(2))
+        #expect(firstInbox.status == .offline)
+        #expect(secondInbox.status == .online)
+        #expect(secondInbox.errors.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func presenceAsksInBatchesAndKeepsEachAnswerWithItsRequest() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let asker = SignalingClient(url: server.url, identity: Identity(), accessToken: LocalServer.token)
+        let otherID = Identity()
+        let other = SignalingClient(url: server.url, identity: otherID, accessToken: LocalServer.token)
+        defer { asker.disconnect(); other.disconnect() }
+        let askerInbox = Inbox(), otherInbox = Inbox()
+        askerInbox.attach(to: asker)
+        otherInbox.attach(to: other)
+        asker.connect(); other.connect()
+        try await poll("both online") { askerInbox.status == .online && otherInbox.status == .online }
+
+        // More IDs than the server takes in one request, the online one in the second batch.
+        var ids = (0..<150).map { _ in Identity().deviceID }
+        ids[100] = otherID.deviceID
+        let many = Answers()
+        asker.presence(of: ids) { many.record($0) }
+        try await poll("batched answer") { many.values.count == 1 }
+        #expect(many.values == [[otherID.deviceID]])
+        #expect(askerInbox.status == .online) // the server took every batch
+
+        // A request that times out does not take the waiter of the one before it.
+        let patient = Answers(), hasty = Answers()
+        asker.presence(of: [otherID.deviceID]) { patient.record($0) }
+        asker.presence(of: [otherID.deviceID], timeout: 0) { hasty.record($0) }
+        try await poll("both done") { patient.values.count == 1 && hasty.values.count == 1 }
+        #expect(hasty.values == [nil])
+        #expect(patient.values == [[otherID.deviceID]])
+
+        // Later requests still get their own answers.
+        let later = Answers()
+        asker.presence(of: [ids[0]]) { later.record($0) }
+        try await poll("later answer") { later.values.count == 1 }
+        #expect(later.values == [[]])
+    }
+
+    @Test func aByeReasonTravelsAndAnUnknownOneIsIgnored() throws {
+        let envelope = SignalEnvelope(.bye, reason: .stale)
+        let data = try JSONEncoder().encode(envelope)
+        #expect(try JSONDecoder().decode(SignalEnvelope.self, from: data) == envelope)
+        let newer = Data(#"{"kind":"bye","reason":"something-new"}"#.utf8)
+        #expect(try JSONDecoder().decode(SignalEnvelope.self, from: newer) == SignalEnvelope(.bye))
+        let older = Data(#"{"kind":"bye"}"#.utf8)
+        #expect(try JSONDecoder().decode(SignalEnvelope.self, from: older) == SignalEnvelope(.bye))
+    }
+}
+
+private final class Answers: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _values: [Set<String>?] = []
+    var values: [Set<String>?] { lock.withLock { _values } }
+    func record(_ value: Set<String>?) { lock.withLock { _values.append(value) } }
 }
 
 private final class Inbox: @unchecked Sendable {
@@ -117,7 +218,16 @@ struct LocalServer {
         node != nil && FileManager.default.fileExists(atPath: directory.appendingPathComponent("node_modules/ws").path)
     }
 
-    static func start(port: Int = Int.random(in: 20_000...40_000)) async throws -> LocalServer {
+    /// Without a port, a random one; tried again on another if the server does not come up there.
+    static func start(port: Int? = nil) async throws -> LocalServer {
+        if let port { return try await launch(port: port) }
+        for _ in 1..<3 {
+            if let server = try? await launch(port: Int.random(in: 20_000...40_000)) { return server }
+        }
+        return try await launch(port: Int.random(in: 20_000...40_000))
+    }
+
+    private static func launch(port: Int) async throws -> LocalServer {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try #require(node))
         process.arguments = ["src/main.ts"]

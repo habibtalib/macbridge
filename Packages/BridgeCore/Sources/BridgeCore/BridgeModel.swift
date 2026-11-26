@@ -138,7 +138,8 @@ public final class BridgeModel: ObservableObject {
     private var hostDisconnectTimer: Task<Void, Never>?
     private var injector: InputInjector?
     private let capturer = ScreenCapturer()
-    private let power = PowerAssertions()
+    /// Internal for tests.
+    let power = PowerAssertions()
     private let lidKeeper: LidClosedKeeper
     private var lidTimer: Task<Void, Never>?
     private var hostDisplay: DisplayInfo?
@@ -184,6 +185,28 @@ public final class BridgeModel: ObservableObject {
         defaults.set(identity.publicKey.base64EncodedString(), forKey: Keys.publicKey)
         capturer.onStop = { [weak self] _ in
             Task { @MainActor in self?.endHosting(notify: true) }
+        }
+        #if os(macOS)
+        // After sleep the socket is often dead without having said so: check it at once.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.signaling?.reconnectIfStale() }
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    private var wakeObserver: NSObjectProtocol?
+    #endif
+
+    /// The app came to the front: be online again as soon as possible. A connection that is
+    /// still trying reconnects now instead of waiting out its backoff.
+    public func resumeConnection() {
+        if let signaling {
+            signaling.reconnectIfStale()
+        } else if signalingStatus == .offline, canGoOnline {
+            goOnline()
         }
     }
 
@@ -330,10 +353,15 @@ public final class BridgeModel: ObservableObject {
         updatePower()
     }
 
-    private func send(_ payload: SignalPayload, to peer: PairedDevice) {
+    private func send(_ payload: SignalPayload, to peer: PairedDevice, reason: ByeReason? = nil) {
         PeerSession.writeStats("signal out to \(peer.name): \(PeerSession.kind(payload)) (server \(signaling == nil ? "none" : "ok"))")
         let auth = SessionAuth.sign(payload, to: peer.id, identity: identity)
-        signaling?.send(SignalEnvelope(payload, auth: auth), to: peer.id)
+        signaling?.send(SignalEnvelope(payload, auth: auth, reason: reason), to: peer.id)
+    }
+
+    /// Turns a request away with a reason the caller can show.
+    private func refuse(_ peer: PairedDevice, _ reason: ByeReason) {
+        send(.bye, to: peer, reason: reason)
     }
 
     private func receive(_ envelope: SignalEnvelope, from peerID: String) {
@@ -346,6 +374,11 @@ public final class BridgeModel: ObservableObject {
                 payload, auth: envelope.auth, from: peer, to: deviceID, lastRequestTimestamp: lastRequest[peerID])
         } catch {
             PeerSession.writeStats("signal from \(peer.name) rejected: \(error) (\(PeerSession.kind(payload)))")
+            // Correctly signed but too old or too new: most likely one of the clocks is off. Say so,
+            // or the caller only sees no answer.
+            if payload == .request, error as? SessionAuth.Failure == .stale {
+                refuse(peer, peer.mayControlThisMac ? .stale : .notAllowed)
+            }
             return
         }
         if peer.id != hostPeer?.id, payload != .request {
@@ -354,6 +387,10 @@ public final class BridgeModel: ObservableObject {
 
         if peer.id == controllerPeer?.id, peer.thisMacMayControl, payload != .request {
             if payload == .bye {
+                // A reason only explains a call still waiting for this host; it is unsigned.
+                if let reason = envelope.reason, case let .calling(host) = controllerStatus, host.id == peer.id {
+                    return endControlling(.failed(Self.refusal(reason, from: displayName(peer))))
+                }
                 // Before any picture arrived, a bye means the other Mac said no.
                 let refused = remoteVideo == nil
                 endControlling(.failed(refused ? "\(displayName(peer)) did not accept the connection" : "\(displayName(peer)) ended the session"))
@@ -364,7 +401,7 @@ public final class BridgeModel: ObservableObject {
         }
         switch payload {
         case .request:
-            guard peer.mayControlThisMac else { return }
+            guard peer.mayControlThisMac else { return refuse(peer, .notAllowed) }
             lastRequest[peerID] = requestTimestamp
             // A Mac set to "ask first" waits for someone here to accept, unless it is already
             // in a session with this Mac (the request is then a retry).
@@ -394,10 +431,20 @@ public final class BridgeModel: ObservableObject {
         case .noSuchPairing:
             failPairing("No Mac is showing that code. Check it and try again.")
         case let .unauthorized(code):
+            // The client has stopped for good: let go of it, and of the wake lock held for it.
+            signaling = nil
             signalingStatus = .offline
             notice = code == "bad-token"
                 ? "The server refused the access token."
                 : "The server refused this device (\(code))."
+        case .replaced:
+            signaling = nil
+            signalingStatus = .offline
+            #if os(macOS)
+            notice = "This Mac is online from another copy of MacBridge. Go online again here to take over."
+            #else
+            notice = "This device is online from another copy of MacBridge. Go online again here to take over."
+            #endif
         case .unsupported:
             break // never passed on by the client
         case let .other(code):
@@ -434,6 +481,7 @@ public final class BridgeModel: ObservableObject {
     /// takes the link's server; otherwise another server waits for `confirmServerSwitch()`.
     /// Offline, it goes online and pairs once the server answers.
     public func pair(using link: PairingLink) {
+        cancelPairing()
         if let server = link.server, Self.serverKey(server) != Self.serverKey(serverURL) {
             // A link can come from anyone: ask before leaving the server the user chose, or
             // before sending it the token the user entered.
@@ -493,8 +541,8 @@ public final class BridgeModel: ObservableObject {
 
     /// Sends a code typed on this Mac to the Mac that is showing it.
     public func pair(usingCode text: String) {
-        guard signalingStatus == .online else { return }
         cancelPairing()
+        guard signalingStatus == .online else { return }
         guard let code = PairingCode(text) else {
             pairingStatus = .failed("That is not a valid code. It has 16 letters and digits.")
             return
@@ -626,10 +674,33 @@ public final class BridgeModel: ObservableObject {
         controllerPeer = host
         lastHost = host
         controllerStatus = .calling(host)
+        let timeout = callTimeout
+        callTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled, let self, case let .calling(calling) = self.controllerStatus, calling.id == host.id else { return }
+            self.send(.bye, to: host)
+            self.endControlling(.failed("No answer from \(self.displayName(host)). Check that it is awake, online and allows control."))
+        }
         Task {
             let servers = await iceServers()
             guard controllerPeer == host, controllerSession == nil else { return } // cancelled meanwhile
             startControlling(host, iceServers: servers)
+        }
+    }
+
+    /// A call the host has not answered by then fails. Internal so tests can shorten it.
+    var callTimeout: TimeInterval = 25
+    private var callTimer: Task<Void, Never>?
+
+    /// What the controller shows when the host turns a request away.
+    nonisolated static func refusal(_ reason: ByeReason, from name: String) -> String {
+        switch reason {
+        case .notAllowed:
+            return "\(name) does not allow control from this device right now."
+        case .stale:
+            return "\(name) turned the request away because the clocks differ. Both clocks must be within a minute of each other: set the date and time automatically on both."
+        case .noScreenPermission:
+            return "\(name) can't share its screen: Screen Recording is not allowed for MacBridge there."
         }
     }
 
@@ -751,6 +822,8 @@ public final class BridgeModel: ObservableObject {
     }
 
     private func endControlling(_ status: ControllerStatus) {
+        callTimer?.cancel()
+        callTimer = nil
         let session = controllerSession
         controllerSession = nil
         controllerPeer = nil
@@ -807,12 +880,12 @@ public final class BridgeModel: ObservableObject {
     private func beginHosting(for peer: PairedDevice) async {
         // Looked up again: the right may have been taken away since the request came in.
         guard allowsControl, paired.first(where: { $0.id == peer.id })?.mayControlThisMac == true else {
-            return send(.bye, to: peer)
+            return refuse(peer, .notAllowed)
         }
         refreshPermissions()
         guard hasScreenPermission else {
             notice = "\(peer.name) tried to connect, but Screen Recording is not allowed for MacBridge."
-            return send(.bye, to: peer)
+            return refuse(peer, .noScreenPermission)
         }
         // One controller at a time: a new request replaces the current session.
         // A retry from the same device must not get a bye: it would end the

@@ -90,7 +90,7 @@ It could refuse service, see which device IDs are online and when, and see the I
 
 What it could still do with the setup messages it forwards:
 
-- **End sessions.** A `bye` (end of session, or "request declined") travels unsigned, so the server, or anyone who controls it, can forge one and end any session or decline any request. That is a denial of service, the same as dropping messages, and gives no access.
+- **End sessions.** A `bye` (end of session, or "request declined") travels unsigned, so the server, or anyone who controls it, can forge one and end any session or decline any request. A forged reason ("not allowed", "clocks differ", "no screen permission") only changes the message shown for a request still waiting. That is a denial of service, the same as dropping messages, and gives no access.
 - **Inject ICE candidates.** Candidates (network addresses to try) also travel unsigned. A forged candidate can make a Mac try to connect to an address the server picks, which reveals that the Mac is online and from where, or sends the connection attempt through a path the attacker controls. It cannot take over the session: the offer and answer are signed by the paired devices and carry the DTLS fingerprints, so the encrypted connection only completes with the real peer. A relayed path still only carries encrypted media and input.
 - **Withhold or misreport presence.** It can say a Mac is offline when it is not.
 

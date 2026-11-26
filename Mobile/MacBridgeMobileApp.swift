@@ -68,7 +68,8 @@ struct RootScreen: View {
                     model.disconnect()
                 }
             case .active:
-                if model.signalingStatus == .offline, model.canGoOnline { model.goOnline() }
+                // A socket left in the background is often dead: check it, or reconnect without backoff.
+                model.resumeConnection()
                 model.refreshPresence()
             default:
                 break

@@ -1,32 +1,51 @@
 import Foundation
+import Network
+
+/// Why a host turned a request away, sent with its `bye`. Unsigned like the `bye` itself: it
+/// can only end a call that is still waiting for that host, which a plain `bye` could too.
+public enum ByeReason: String, Sendable, Codable {
+    /// This device may not control the host, or the host does not allow control right now.
+    case notAllowed = "not-allowed"
+    /// The request's time was too far from the host's clock.
+    case stale
+    /// The host may not record its screen.
+    case noScreenPermission = "no-screen-permission"
+}
 
 /// A setup message plus, where required, the sender's proof of identity.
 public struct SignalEnvelope: Equatable, Sendable, Codable {
     public var payload: SignalPayload
     public var auth: SignalAuth?
+    /// Only on a `bye`. Older apps ignore it; a reason this app does not know reads as nil.
+    public var reason: ByeReason?
 
-    public init(_ payload: SignalPayload, auth: SignalAuth? = nil) {
+    public init(_ payload: SignalPayload, auth: SignalAuth? = nil, reason: ByeReason? = nil) {
         self.payload = payload
         self.auth = auth
+        self.reason = reason
     }
 
-    private enum CodingKeys: String, CodingKey { case auth }
+    private enum CodingKeys: String, CodingKey { case auth, reason }
 
     public init(from decoder: Decoder) throws {
         payload = try SignalPayload(from: decoder)
-        auth = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(SignalAuth.self, forKey: .auth)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        auth = try c.decodeIfPresent(SignalAuth.self, forKey: .auth)
+        reason = (try? c.decodeIfPresent(String.self, forKey: .reason)).flatMap(ByeReason.init(rawValue:))
     }
 
     public func encode(to encoder: Encoder) throws {
         try payload.encode(to: encoder)
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(auth, forKey: .auth)
+        try container.encodeIfPresent(reason, forKey: .reason)
     }
 }
 
 /// WebSocket connection to the signaling server. Logs in by proving it holds
 /// the identity key, then stays connected: if the socket drops it reconnects
-/// with backoff until `disconnect()` is called.
+/// with backoff until `disconnect()` is called. A ping that goes unanswered
+/// counts as a drop, and a network change reconnects at once.
 ///
 /// Callbacks are delivered on the main queue.
 public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
@@ -44,6 +63,10 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         /// The server refused the login (wrong access token or key). The
         /// client stops reconnecting; retrying cannot succeed.
         case unauthorized(String)
+        /// Another connection logged in with this identity (another copy of the
+        /// app with the same key). The client stops reconnecting, or the two would
+        /// take turns pushing each other off.
+        case replaced
         /// The server does not know a message of this type. It stays connected.
         case unsupported(String)
         case other(String)
@@ -57,6 +80,18 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     /// The device whose code we typed answers.
     public var onPairReply: ((_ from: String, _ sealed: Data) -> Void)?
 
+    /// How often an online connection is checked, and how long the pong may take.
+    /// Internal so tests can shorten them; set before `connect()`.
+    var pingInterval: TimeInterval = 20
+    var pingTimeout: TimeInterval = 10
+    /// A connection not logged in by then is dropped; pings only start once online.
+    var loginTimeout: TimeInterval = 15
+
+    /// The server's close code for a connection taken over by the same identity.
+    static let replacedCloseCode = 4001
+    /// Most IDs the server answers in one presence request.
+    static let presenceBatch = 64
+
     private let url: URL
     private let identity: Identity
     private let accessToken: String?
@@ -66,13 +101,25 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     /// Holds this client as its delegate until invalidated in `stop()`.
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
+    /// The task dropped last, until the next one opens: its close code may arrive after the drop.
+    private var droppedTask: URLSessionWebSocketTask?
     private var wantsConnection = false
     private var attempt = 0
     private var status: Status = .offline
     private var iceWaiters: [([IceServer]) -> Void] = []
+    /// One per presence request sent, in order: the server answers them in the order asked.
+    /// A request that timed out keeps its place, so later answers still go to the right one.
     private var presenceWaiters: [(Set<String>?) -> Void] = []
-    /// An older server closes the connection on a presence request: ask once, then never again.
+    /// A server that does not know presence answers "unsupported": ask once, then never again.
     private var presenceUnsupported = false
+    /// A server from before presence and "unsupported" existed closes the connection with
+    /// bad-message instead. Twice in a row with presence asked, and presence is off.
+    private var presenceStrikes = 0
+    /// The ping waiting for its pong.
+    private var pingNumber = 0
+    private var awaitedPing: Int?
+    private var pathMonitor: NWPathMonitor?
+    private var lastPath: (satisfied: Bool, interfaces: [String])?
 
     public init(url: URL, identity: Identity, accessToken: String? = nil) {
         self.url = url
@@ -85,12 +132,28 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             guard !self.wantsConnection else { return }
             self.wantsConnection = true
             self.attempt = 0
+            self.watchNetwork()
             self.open()
         }
     }
 
     public func disconnect() {
         queue.async { self.stop() }
+    }
+
+    /// The device woke up or the app came to the front: the connection may be dead without
+    /// anything having said so. Online, a ping checks it now; otherwise it reconnects now,
+    /// without waiting out the backoff.
+    public func reconnectIfStale() {
+        queue.async {
+            guard self.wantsConnection else { return }
+            self.attempt = 0
+            if let task = self.task, self.status == .online {
+                self.ping(task)
+            } else {
+                self.reconnectNow()
+            }
+        }
     }
 
     public func send(_ envelope: SignalEnvelope, to peer: String) {
@@ -119,6 +182,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
 
     /// Asks which of these devices are connected to the server. `completion` gets the connected ones,
     /// or nil when the server gave no answer (offline, or a server from before this request existed).
+    /// More IDs than the server takes at once are asked in batches.
     public func presence(of ids: [String], timeout: TimeInterval = 3, completion: @escaping (Set<String>?) -> Void) {
         queue.async {
             guard let task = self.task, self.status == .online, !self.presenceUnsupported, !ids.isEmpty else {
@@ -130,12 +194,22 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
                 finished = true
                 DispatchQueue.main.async { completion(online) }
             }
-            self.presenceWaiters.append(finish)
-            self.write(.presence(ids: Array(ids.prefix(64))), on: task)
-            self.queue.asyncAfter(deadline: .now() + timeout) {
-                self.presenceWaiters.removeAll()
-                finish(nil)
+            let batches = stride(from: 0, to: ids.count, by: Self.presenceBatch).map {
+                Array(ids[$0 ..< min($0 + Self.presenceBatch, ids.count)])
             }
+            var waiting = batches.count
+            var online = Set<String>()
+            for batch in batches {
+                self.presenceWaiters.append { answer in
+                    guard let answer else { return finish(nil) }
+                    online.formUnion(answer)
+                    waiting -= 1
+                    if waiting == 0 { finish(online) }
+                }
+                self.write(.presence(ids: batch), on: task)
+            }
+            // Only this request gives up; its waiters stay queued for answers still on the way.
+            self.queue.asyncAfter(deadline: .now() + timeout) { finish(nil) }
         }
     }
 
@@ -153,21 +227,45 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         let task = session.webSocketTask(with: url)
         task.maximumMessageSize = 256 * 1024
         self.task = task
+        droppedTask = nil
         task.resume()
         write(.hello(id: identity.deviceID, key: identity.publicKey, token: accessToken), on: task)
         receive(on: task)
+        queue.asyncAfter(deadline: .now() + loginTimeout) {
+            guard task === self.task, self.status != .online else { return }
+            self.dropped(task)
+        }
     }
 
     private func stop() {
         wantsConnection = false
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastPath = nil
+        if let task { discard(task) }
         // A URLSession keeps its delegate until invalidated: without this the
         // client, and the model it calls back, would never be freed.
         session?.invalidateAndCancel()
         session = nil
-        flushIceWaiters()
         set(.offline)
+    }
+
+    /// Lets go of the current task and fails everything waiting on it.
+    private func discard(_ task: URLSessionWebSocketTask) {
+        if task === self.task { self.task = nil }
+        droppedTask = task
+        awaitedPing = nil
+        task.cancel(with: .goingAway, reason: nil)
+        flushIceWaiters()
+        flushPresenceWaiters()
+    }
+
+    /// Drops the current connection, if any, and opens a new one at once.
+    private func reconnectNow() {
+        guard wantsConnection else { return }
+        if let task { discard(task) }
+        attempt = 0
+        open()
     }
 
     private func receive(on task: URLSessionWebSocketTask) {
@@ -186,12 +284,11 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         }
     }
 
-    private func dropped(_ task: URLSessionWebSocketTask) {
+    private func dropped(_ task: URLSessionWebSocketTask, closeCode: Int? = nil) {
         guard task === self.task else { return }
-        self.task = nil
-        task.cancel(with: .goingAway, reason: nil)
-        flushIceWaiters()
+        discard(task)
         guard wantsConnection else { return set(.offline) }
+        if (closeCode ?? task.closeCode.rawValue) == Self.replacedCloseCode { return replaced() }
         set(.connecting)
         attempt += 1
         let delay = min(30, pow(2, Double(attempt - 1)))
@@ -199,6 +296,60 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             guard self.wantsConnection, self.task == nil else { return }
             self.open()
         }
+    }
+
+    /// Another copy logged in with this identity. Reconnecting would push it off in turn.
+    private func replaced() {
+        stop()
+        DispatchQueue.main.async { self.onError?(.replaced) }
+    }
+
+    // MARK: Keepalive and network changes
+
+    private func schedulePing(_ task: URLSessionWebSocketTask) {
+        queue.asyncAfter(deadline: .now() + pingInterval) {
+            guard task === self.task, self.status == .online, self.awaitedPing == nil else { return }
+            self.ping(task)
+        }
+    }
+
+    /// A socket can die without a close (sleep, a network that went away): no pong in time
+    /// counts as a drop.
+    private func ping(_ task: URLSessionWebSocketTask) {
+        guard awaitedPing == nil else { return } // one already on its way checks the same thing
+        pingNumber += 1
+        let number = pingNumber
+        awaitedPing = number
+        task.sendPing { [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                guard task === self.task, self.awaitedPing == number else { return }
+                if error != nil { return self.dropped(task) }
+                self.awaitedPing = nil
+                self.schedulePing(task)
+            }
+        }
+        queue.asyncAfter(deadline: .now() + pingTimeout) {
+            guard task === self.task, self.awaitedPing == number else { return }
+            self.dropped(task)
+        }
+    }
+
+    private func watchNetwork() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in self?.pathChanged(path) }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
+    }
+
+    /// Back on a network, or on another one: the old socket is likely dead or about to be,
+    /// and waiting out the backoff or a ping would only leave the device unreachable longer.
+    private func pathChanged(_ path: NWPath) {
+        let now = (satisfied: path.status == .satisfied, interfaces: path.availableInterfaces.map(\.name))
+        defer { lastPath = now }
+        guard let last = lastPath, wantsConnection, now.satisfied else { return }
+        if !last.satisfied || last.interfaces != now.interfaces { reconnectNow() }
     }
 
     private func handle(_ message: URLSessionWebSocketTask.Message, on task: URLSessionWebSocketTask) {
@@ -216,6 +367,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         case .welcome:
             attempt = 0
             set(.online)
+            schedulePing(task)
         case let .signal(from, envelope):
             DispatchQueue.main.async { self.onSignal?(from, envelope) }
         case let .ice(servers):
@@ -225,17 +377,20 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         case let .pairReply(from, sealed):
             DispatchQueue.main.async { self.onPairReply?(from, sealed) }
         case let .presence(online):
-            let waiters = presenceWaiters
-            presenceWaiters.removeAll()
-            waiters.forEach { $0(Set(online)) }
+            presenceStrikes = 0
+            guard !presenceWaiters.isEmpty else { return }
+            presenceWaiters.removeFirst()(Set(online))
         case let .error(error):
-            if error == .other("bad-message") || error == .unsupported("presence"), !presenceWaiters.isEmpty {
-                // The server does not know the request. An older one closes the connection; the
-                // reconnect that follows must not ask again.
+            if error == .unsupported("presence") {
                 presenceUnsupported = true
-                let waiters = presenceWaiters
-                presenceWaiters.removeAll()
-                waiters.forEach { $0(nil) }
+                return flushPresenceWaiters()
+            }
+            if error == .other("bad-message"), !presenceWaiters.isEmpty {
+                // The server closes the connection after this. It may be an old server that
+                // does not know presence, or another message it did not like: off only on a repeat.
+                presenceStrikes += 1
+                if presenceStrikes >= 2 { presenceUnsupported = true }
+                flushPresenceWaiters()
                 return
             }
             // The server does not know some other message and stays connected: nothing to show.
@@ -249,6 +404,12 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         let waiters = iceWaiters
         iceWaiters.removeAll()
         waiters.forEach { $0(servers) }
+    }
+
+    private func flushPresenceWaiters() {
+        let waiters = presenceWaiters
+        presenceWaiters.removeAll()
+        waiters.forEach { $0(nil) }
     }
 
     /// Sends once logged in; dropped otherwise.
@@ -278,7 +439,15 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         _ session: URLSession, webSocketTask: URLSessionWebSocketTask,
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?
     ) {
-        queue.async { self.dropped(webSocketTask) }
+        queue.async {
+            // The receive may have failed first and dropped the task already; the code still counts
+            // while no newer connection has opened.
+            if closeCode.rawValue == Self.replacedCloseCode, self.wantsConnection,
+               self.task == nil, webSocketTask === self.droppedTask {
+                return self.replaced()
+            }
+            self.dropped(webSocketTask, closeCode: closeCode.rawValue)
+        }
     }
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

@@ -265,9 +265,148 @@ struct BridgeModelTests {
         // Accepted, then revoked before the session starts: the session must look the right up again.
         studio.acceptRequest()
         studio.revokeControl(from: laptopAtStudio)
-        try await poll("laptop is told") { laptop.controllerStatus == .failed("Studio did not accept the connection") }
+        try await poll("laptop is told") { laptop.controllerStatus == .failed(BridgeModel.refusal(.notAllowed, from: "Studio")) }
         #expect(studio.hostStatus == .idle)
         #expect(studio.notice?.contains("tried to connect") != true) // turned away before any permission check
+    }
+
+    /// Laptop may control Studio; Studio's model goes offline and a bare client with Studio's key
+    /// stands in for it, to answer exactly as a test needs.
+    private func laptopCallingAStandIn(_ server: LocalServer) async throws
+        -> (laptop: BridgeModel, studioID: Identity, standIn: SignalingClient, received: Received)
+    {
+        let (studio, laptop) = try await pairedModels(server)
+        studio.goOffline()
+        let standIn = SignalingClient(url: server.url, identity: studio.identity, accessToken: LocalServer.token)
+        let received = Received()
+        standIn.onStatus = { received.online = $0 == .online }
+        standIn.onSignal = { _, envelope in received.payloads.append(envelope.payload) }
+        standIn.connect()
+        try await poll("stand-in online") { received.online }
+        return (laptop, studio.identity, standIn, received)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aCallNobodyAnswersFails() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (laptop, _, standIn, received) = try await laptopCallingAStandIn(server)
+        defer { laptop.goOffline(); standIn.disconnect() }
+        laptop.callTimeout = 0.5
+        let studio = try #require(laptop.controllable.first)
+        laptop.connect(to: studio)
+        try await poll("request arrives") { received.payloads == [.request] }
+        try await poll("gives up") { laptop.controllerStatus == .failed("No answer from Studio. Check that it is awake, online and allows control.") }
+        try await poll("host told") { received.payloads == [.request, .bye] }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRefusalSaysWhy() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (laptop, _, standIn, received) = try await laptopCallingAStandIn(server)
+        defer { laptop.goOffline(); standIn.disconnect() }
+        let studio = try #require(laptop.controllable.first)
+
+        // An unsigned reason does nothing to a device that is not calling.
+        standIn.send(SignalEnvelope(.bye, reason: .notAllowed), to: laptop.deviceID)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(laptop.controllerStatus == .idle)
+
+        laptop.connect(to: studio)
+        try await poll("request arrives") { received.payloads == [.request] }
+        standIn.send(SignalEnvelope(.bye, reason: .stale), to: laptop.deviceID)
+        try await poll("reason shown") { laptop.controllerStatus == .failed(BridgeModel.refusal(.stale, from: "Studio")) }
+        if case let .failed(message) = laptop.controllerStatus { #expect(message.contains("within a minute")) }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aHostTurningARequestAwaySaysWhy() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+
+        // Control is off on Studio.
+        laptop.connect(to: try #require(laptop.controllable.first))
+        try await poll("not allowed") { laptop.controllerStatus == .failed(BridgeModel.refusal(.notAllowed, from: "Studio")) }
+
+        // A correctly signed request from a clock two minutes off.
+        studio.allowsControl = true
+        laptop.goOffline()
+        let laptopClient = SignalingClient(url: server.url, identity: laptop.identity, accessToken: LocalServer.token)
+        defer { laptopClient.disconnect() }
+        let received = Received()
+        laptopClient.onStatus = { received.online = $0 == .online }
+        laptopClient.onSignal = { _, envelope in received.reasons.append(envelope.reason) }
+        laptopClient.connect()
+        try await poll("laptop key online") { received.online }
+        let old = SessionAuth.sign(.request, to: studio.deviceID, identity: laptop.identity, now: Date().addingTimeInterval(-120))
+        laptopClient.send(SignalEnvelope(.request, auth: old), to: studio.deviceID)
+        try await poll("stale reason") { received.reasons == [.stale] }
+        #expect(studio.hostStatus == .idle)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRefusedLoginLetsTheMacSleep() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let studio = makeModel("Studio", server: server, token: "not-the-token")
+        defer { studio.goOffline() }
+        studio.allowsControl = true
+        studio.goOnline()
+        #expect(studio.power.keepSystemAwake)
+        try await poll("refused") { studio.notice == "The server refused the access token." }
+        #expect(studio.signalingStatus == .offline)
+        #expect(!studio.power.keepSystemAwake)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func anotherCopyOnlineSaysSoAndStaysOff() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let studio = makeModel("Studio", server: server)
+        defer { studio.goOffline() }
+        studio.allowsControl = true
+        studio.goOnline()
+        try await poll("online") { studio.signalingStatus == .online }
+        let copy = SignalingClient(url: server.url, identity: studio.identity, accessToken: LocalServer.token)
+        defer { copy.disconnect() }
+        copy.connect()
+        try await poll("told") { studio.notice?.contains("another copy of MacBridge") == true }
+        #expect(studio.signalingStatus == .offline)
+        #expect(!studio.power.keepSystemAwake)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func pairingAgainDropsTheCodeShowing() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let studio = makeModel("Studio", server: server)
+        defer { studio.goOffline() }
+        studio.goOnline()
+        try await poll("online") { studio.signalingStatus == .online }
+        studio.showPairingCode()
+        #expect(shownCode(studio) != nil)
+        studio.pair(using: PairingLink(code: PairingCode().display, server: server.url.absoluteString))
+        #expect(studio.pairingStatus == .waiting)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func typingACodeWhileNotOnlineDropsTheScanWaitingForTheServer() async throws {
+        let server = try await LocalServer.start()
+        let url = server.url.absoluteString
+        server.stop() // nobody answers there now
+        let phone = makeUnsetModel("Phone")
+        phone.serverURL = url
+        defer { phone.goOffline() }
+        phone.pair(using: PairingLink(code: PairingCode().display, server: url))
+        #expect(phone.pairingStatus == .waiting)
+        #expect(phone.signalingStatus != .online)
+        phone.pair(usingCode: PairingCode().display) // not sent while offline, but the scan stops waiting
+        #expect(phone.pairingStatus == .idle)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(phone.pairingStatus == .idle)
     }
 
     /// A model with a token but no server yet, as on first launch.
@@ -417,4 +556,11 @@ struct BridgeModelTests {
         #expect(BridgeModel.label("a\u{07}b\u{1B}c", id: "abcdefgh") == "abc")
         #expect(BridgeModel.label(String(repeating: "x", count: 500), id: "abcdefgh").count == 64)
     }
+}
+
+/// What a bare client received, written on the main queue.
+private final class Received: @unchecked Sendable {
+    var online = false
+    var payloads: [SignalPayload] = []
+    var reasons: [ByeReason?] = []
 }
