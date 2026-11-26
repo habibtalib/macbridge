@@ -18,7 +18,7 @@ public struct DisplayInfo: Identifiable, Equatable, Sendable {
 
 public final class ScreenCapturer: @unchecked Sendable {
     public struct Unavailable: Error {}
-    public var onFrame: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)?
+    public func setOnFrame(_ handler: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)?) {}
     public var onStop: ((Error?) -> Void)?
     public init() {}
     public static var hasPermission: Bool { false }
@@ -60,7 +60,7 @@ public enum Headless {
 }
 
 public final class DisplayChangeWatcher {
-    public init(onChange: @escaping () -> Void) {}
+    public init(onChange: @escaping (_ changed: [CGDirectDisplayID: Bool]) -> Void) {}
 }
 
 public enum LidAndPower {

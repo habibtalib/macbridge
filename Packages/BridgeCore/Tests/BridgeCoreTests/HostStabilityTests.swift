@@ -66,6 +66,21 @@ private enum Posted: Equatable {
         #expect(log.all == [.key(0, isDown: true), .key(0, isDown: false), .key(1, isDown: true)])
     }
 
+    /// Quitting waits on the injector's queue from the main thread: a clipboard
+    /// write still queued must not then wait on the main thread.
+    @Test func clipboardIsSkippedOnceStopIsAsked() {
+        let log = Recorder<Posted>()
+        // The first key keeps the queue busy, so the clipboard is still queued when stop is asked.
+        let injector = InputInjector(display: display, writeClipboard: { log.append(.clipboard($0)) }, post: { _ in
+            if log.all.isEmpty { Thread.sleep(forTimeInterval: 0.2) }
+            log.append(.key(0, isDown: true))
+        })
+        injector.handle(.key(keyCode: 0, isDown: true, modifiers: 0))
+        injector.handle(.clipboard(text: "late"))
+        injector.stop(waitUntilDone: true)
+        #expect(!log.all.contains(.clipboard("late")))
+    }
+
     /// ⌘V follows the clipboard text: the text must be on the clipboard first.
     @Test(.timeLimit(.minutes(1))) func clipboardIsWrittenBeforeTheNextKey() async {
         let log = Recorder<Posted>()
@@ -75,6 +90,36 @@ private enum Posted: Equatable {
         // The write happens on the main queue: wait off it.
         await Task.detached { injector.drain() }.value
         #expect(log.all == [.clipboard("pasted"), .key(9, isDown: true)])
+    }
+}
+
+@Suite struct DisplayCheckTests {
+    private func info(_ id: CGDirectDisplayID, width: CGFloat = 1440, x: CGFloat = 0) -> DisplayInfo {
+        DisplayInfo(id: id, pointSize: CGSize(width: width, height: 900), pixelSize: CGSize(width: width * 2, height: 1800),
+                    origin: CGPoint(x: x, y: 0), isMain: id == 1)
+    }
+
+    /// Lid closed or monitor unplugged: the stream stops first, and the display is no longer listed.
+    @Test func streamStoppedWithItsDisplayGone() {
+        #expect(BridgeModel.check(shown: 2, as: info(2), listed: [info(1)], captureStopped: true) == .gone)
+        // Nothing left at all (closed lid, no monitor): a virtual display is the way on.
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: [], captureStopped: true) == .gone)
+    }
+
+    @Test func streamStoppedWithItsDisplayStillThereRestarts() {
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: [info(1), info(2)], captureStopped: true) == .restart)
+        // The list could not be read: try the same display; if that fails the session ends.
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: nil, captureStopped: true) == .restart)
+    }
+
+    @Test func changesElsewhereLeaveCaptureAlone() {
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: [info(1), info(2)], captureStopped: false) == .unchanged)
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: nil, captureStopped: false) == .unchanged)
+    }
+
+    @Test func resizedOrMovedDisplayRestarts() {
+        #expect(BridgeModel.check(shown: 1, as: info(1), listed: [info(1, width: 1728)], captureStopped: false) == .restart)
+        #expect(BridgeModel.check(shown: 2, as: info(2), listed: [info(1), info(2, x: -1440)], captureStopped: false) == .restart)
     }
 }
 

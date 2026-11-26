@@ -184,7 +184,17 @@ public final class BridgeModel: ObservableObject {
         // Macs you already control by exchanging these over SSH.
         defaults.set(identity.publicKey.base64EncodedString(), forKey: Keys.publicKey)
         capturer.onStop = { [weak self] _ in
-            Task { @MainActor in self?.endHosting(notify: true) }
+            Task { @MainActor in
+                guard let self else { return }
+                // Display unplugged, lid closed: capture what is left (or a virtual display).
+                // The session ends only if nothing can be captured. Before the first
+                // capture is shown there is nothing to fall back to.
+                if self.hostSession != nil, self.hostDisplay != nil {
+                    self.reconfigureCapture(.captureStopped)
+                } else {
+                    self.endHosting(notify: true)
+                }
+            }
         }
         #if os(macOS)
         // After sleep the socket is often dead without having said so: check it at once.
@@ -980,12 +990,12 @@ public final class BridgeModel: ObservableObject {
                     await self.sendDisplays()
                 }
             }
-            capturer.onFrame = { [weak session] buffer, timestampNs in
+            capturer.setOnFrame { [weak session] buffer, timestampNs in
                 session?.push(buffer, timestampNs: timestampNs)
             }
             // Displays plugged in, unplugged or set to another resolution mid-session.
-            displayWatcher = DisplayChangeWatcher { [weak self] in
-                MainActor.assumeIsolated { self?.reconfigureCapture(.displaysChanged) }
+            displayWatcher = DisplayChangeWatcher { [weak self] changed in
+                MainActor.assumeIsolated { self?.displaysChanged(changed) }
             }
             session.start()
             PeerSession.writeStats("session started for \(peer.name)")
@@ -1015,13 +1025,15 @@ public final class BridgeModel: ObservableObject {
         guard Headless.needsVirtualDisplay(ignoring: virtualDisplay?.displayID) else {
             if let kept = virtualDisplay {
                 virtualDisplay = nil
-                stopCapture(releasing: kept)
+                release(kept)
             }
             return nil
         }
         if virtualDisplay == nil {
             do {
-                virtualDisplay = try VirtualDisplay()
+                let created = try VirtualDisplay()
+                releasedDisplays.remove(created.displayID) // the ID may be handed out again
+                virtualDisplay = created
             } catch {
                 notice = "This Mac has no screen turned on (lid closed?) and a virtual display could not be created; the picture may be black."
                 return nil
@@ -1069,6 +1081,16 @@ public final class BridgeModel: ObservableObject {
         }.value
     }
 
+    /// Virtual displays let go of whose removal is still to be reported. Their
+    /// removal is expected, not a change for the session to react to.
+    private var releasedDisplays: Set<CGDirectDisplayID> = []
+
+    /// Stops capture, then removes the virtual display.
+    private func release(_ virtual: VirtualDisplay) {
+        releasedDisplays.insert(virtual.displayID)
+        stopCapture(releasing: virtual)
+    }
+
     /// The virtual display goes only after capture has stopped, so the
     /// stream does not end with an error first.
     private func stopCapture(releasing virtual: VirtualDisplay? = nil) {
@@ -1080,10 +1102,37 @@ public final class BridgeModel: ObservableObject {
 
     // MARK: Changing what is captured
 
-    private enum CaptureChange {
+    private enum CaptureChange: Equatable {
         /// From the controller: `.quality`, `.nextDisplay` or `.selectDisplay`.
         case request(InputMessage)
         case displaysChanged
+        /// The system stopped the capture stream (its display went away).
+        case captureStopped
+    }
+
+    /// What a display change, or a stopped stream, means for the display being shown.
+    enum DisplayCheck: Equatable {
+        case unchanged
+        /// Still there: start again on it (moved, resized, or the stream stopped).
+        case restart
+        /// No longer listed: pick another.
+        case gone
+    }
+
+    /// `listed`: the displays capture offers now; nil if they could not be read.
+    nonisolated static func check(shown id: CGDirectDisplayID?, as shownInfo: DisplayInfo?, listed: [DisplayInfo]?,
+                                  captureStopped: Bool) -> DisplayCheck {
+        guard let listed else { return captureStopped ? .restart : .unchanged }
+        guard let now = listed.first(where: { $0.id == id }) else { return .gone }
+        return captureStopped || now != shownInfo ? .restart : .unchanged
+    }
+
+    /// From the watcher: the displays that changed, true for a removed one.
+    private func displaysChanged(_ changed: [CGDirectDisplayID: Bool]) {
+        let expected = Set(changed.filter { $0.value && releasedDisplays.contains($0.key) }.keys)
+        releasedDisplays.subtract(expected)
+        guard changed.count > expected.count else { return }
+        reconfigureCapture(.displaysChanged)
     }
 
     /// Capture changes run one at a time, in order.
@@ -1127,14 +1176,19 @@ public final class BridgeModel: ObservableObject {
                 target = id
                 changed = true
             }
-        case .displaysChanged:
-            guard let displays = try? await ScreenCapturer.displays() else { break }
-            if let shown = displays.first(where: { $0.id == target }) {
+        case .displaysChanged, .captureStopped:
+            let listed = try? await ScreenCapturer.displays()
+            switch Self.check(shown: target, as: hostDisplay, listed: listed, captureStopped: change == .captureStopped) {
+            case .unchanged:
+                break
+            case .restart:
                 // Moved or resized: the pointer mapping and the stream size follow.
-                changed = shown != hostDisplay
-            } else {
-                // The display shown is gone: the main display, or the virtual one if this Mac has no other.
-                target = virtualDisplay?.displayID
+                changed = true
+            case .gone:
+                // As for a new session: the main display, or a virtual one when no screen is left
+                // (lid closed, no monitor).
+                guard hostSession === session else { return }
+                target = await displayForSession()
                 changed = true
             }
         case .request:
@@ -1218,7 +1272,7 @@ public final class BridgeModel: ObservableObject {
         power.keepDisplayAwake = false
         hostDisplay = nil
         logSessionEnd()
-        capturer.onFrame = nil
+        capturer.setOnFrame(nil)
         displayWatcher = nil
         reconfigureTask?.cancel()
         reconfigureTask = nil
@@ -1231,9 +1285,12 @@ public final class BridgeModel: ObservableObject {
         injector?.stop(waitUntilDone: waitForInputRelease)
         injector = nil
         session?.close()
-        let virtual = keepVirtualDisplay ? nil : virtualDisplay
-        if !keepVirtualDisplay { virtualDisplay = nil }
-        stopCapture(releasing: virtual)
+        if !keepVirtualDisplay, let virtual = virtualDisplay {
+            virtualDisplay = nil
+            release(virtual)
+        } else {
+            stopCapture()
+        }
     }
 
     // MARK: - Session log

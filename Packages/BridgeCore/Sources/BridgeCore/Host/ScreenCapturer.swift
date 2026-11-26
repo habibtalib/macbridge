@@ -62,11 +62,11 @@ struct StreamSlot<Stream: AnyObject> {
 /// Captures one display with ScreenCaptureKit and hands out frames ready for
 /// the video encoder.
 public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    /// Called on a private queue for every new frame. Changes are applied on
-    /// that queue, in the order they were made.
-    public var onFrame: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)? {
-        get { frameQueue.sync { frameHandler } }
-        set { frameQueue.async { self.frameHandler = newValue } }
+    /// Sets what is called on a private queue for every new frame. Changes are
+    /// applied on that queue, in the order they were made. Set-only: reading it
+    /// back would mean waiting on that queue.
+    public func setOnFrame(_ handler: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)?) {
+        frameQueue.async { self.frameHandler = handler }
     }
     /// Called if the system stops the current stream (permission revoked, display unplugged).
     /// Set it once, before the first start.

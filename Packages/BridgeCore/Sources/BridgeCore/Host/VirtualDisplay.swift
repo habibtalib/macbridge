@@ -141,12 +141,14 @@ public final class DisplayChangeWatcher {
         weak var watcher: DisplayChangeWatcher?
     }
 
-    private let onChange: () -> Void
+    /// The displays that changed since the last report; true for one that was removed.
+    private let onChange: (_ changed: [CGDirectDisplayID: Bool]) -> Void
     private let token = Token()
     private var pending: DispatchWorkItem?
+    private var changed: [CGDirectDisplayID: Bool] = [:]
     static let settleDelay: TimeInterval = 0.5
 
-    public init(onChange: @escaping () -> Void) {
+    public init(onChange: @escaping (_ changed: [CGDirectDisplayID: Bool]) -> Void) {
         self.onChange = onChange
         token.watcher = self
         CGDisplayRegisterReconfigurationCallback(Self.callback, Unmanaged.passRetained(token).toOpaque())
@@ -159,18 +161,25 @@ public final class DisplayChangeWatcher {
         Unmanaged<Token>.fromOpaque(pointer).release()
     }
 
-    private static let callback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+    private static let callback: CGDisplayReconfigurationCallBack = { display, flags, userInfo in
         // Each change is reported twice: before (begin flag) and after. Only "after" counts.
         guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
         let token = Unmanaged<Token>.fromOpaque(userInfo).takeUnretainedValue()
-        DispatchQueue.main.async { token.watcher?.changed() }
+        let removed = flags.contains(.removeFlag)
+        DispatchQueue.main.async { token.watcher?.changed(display, removed: removed) }
     }
 
     /// On main. One change brings several callbacks (one per display): they
     /// are reported as one.
-    private func changed() {
+    private func changed(_ display: CGDirectDisplayID, removed: Bool) {
+        changed[display] = (changed[display] ?? false) || removed
         pending?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.onChange() }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let changed = self.changed
+            self.changed = [:]
+            self.onChange(changed)
+        }
         pending = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleDelay, execute: work)
     }

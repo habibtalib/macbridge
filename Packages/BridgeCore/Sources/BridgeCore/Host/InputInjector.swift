@@ -23,6 +23,15 @@ public final class InputInjector: @unchecked Sendable {
     /// Set by `stop()`: input still queued or arriving later is dropped, so
     /// nothing can be pressed again after everything was let go.
     private var stopped = false
+    /// Set by `stop()` before it queues anything, read on `queue`: a clipboard
+    /// write still waiting in the queue is skipped, so a quitting main thread
+    /// that waits on the queue never waits on the main thread in turn.
+    private let stopRequested = NSLock()
+    private var _isStopRequested = false
+    private var isStopRequested: Bool {
+        get { stopRequested.withLock { _isStopRequested } }
+        set { stopRequested.withLock { _isStopRequested = newValue } }
+    }
 
     /// - Parameter writeClipboard: puts text received from the controller on
     ///   the clipboard; called on the main queue, before any later input is injected.
@@ -73,6 +82,7 @@ public final class InputInjector: @unchecked Sendable {
     /// Releases everything and drops all input from now on. The session is over.
     /// `waitUntilDone`: returns only once the releases are posted (the app is quitting).
     public func stop(waitUntilDone: Bool = false) {
+        isStopRequested = true
         let work = {
             self.releaseAllLocked()
             self.stopped = true
@@ -126,9 +136,10 @@ public final class InputInjector: @unchecked Sendable {
             postKey(keyCode, isDown: isDown, flags: flags)
 
         case let .clipboard(text):
+            // The session is ending: nothing will be pasted any more.
+            guard !isStopRequested else { return }
             // ⌘V follows right behind the text: it must be on the clipboard before
-            // the next event is injected. The wait is bounded so a main thread
-            // that waits on this queue (quitting) cannot lock up.
+            // the next event is injected. The wait is bounded, as a backstop.
             let written = DispatchSemaphore(value: 0)
             let write = writeClipboard
             DispatchQueue.main.async {
