@@ -6,6 +6,7 @@ import SwiftUI
 struct ThisMacPanel: View {
     @EnvironmentObject private var model: BridgeModel
     @State private var copied = false
+    @State private var copiedCode = false
 
     private var isOnline: Bool { model.signalingStatus == .online }
 
@@ -92,6 +93,9 @@ struct ThisMacPanel: View {
             case .online:
                 Circle().fill(.green).frame(width: 8, height: 8)
                 Text("Online").foregroundStyle(.secondary)
+                if let host = URL(string: model.serverURL)?.host {
+                    Text("· \(host)").font(.caption).foregroundStyle(.tertiary).lineLimit(1)
+                }
             case .connecting:
                 ProgressView().controlSize(.mini)
                 Text("Connecting…").foregroundStyle(.secondary)
@@ -113,10 +117,22 @@ struct ThisMacPanel: View {
         if case let .showingCode(code, expires) = model.pairingStatus {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Pairing code").font(.caption).foregroundStyle(.secondary)
-                Text(code)
-                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                    .textSelection(.enabled)
-                    .lineLimit(1).minimumScaleFactor(0.7)
+                HStack(spacing: 6) {
+                    Text(code)
+                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(code, forType: .string)
+                        copiedCode = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedCode = false }
+                    } label: {
+                        Image(systemName: copiedCode ? "checkmark" : "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy pairing code")
+                }
                 if let qr = Self.qrCode(PairingLink(code: code, server: model.serverURL).url?.absoluteString ?? code) {
                     Image(nsImage: qr).interpolation(.none).resizable().frame(width: 120, height: 120)
                         .padding(6).background(Color.white, in: RoundedRectangle(cornerRadius: 6))

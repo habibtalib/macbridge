@@ -88,12 +88,16 @@ struct RootScreen: View {
 struct ConnectingScreen: View {
     let name: String
     let cancel: () -> Void
+    @State private var started = Date()
 
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "desktopcomputer").font(.system(size: 52, weight: .light)).foregroundStyle(.secondary)
             Text("Connecting to \(name)…").font(.title2.weight(.semibold)).multilineTextAlignment(.center)
-            ProgressView()
+            HStack(spacing: 8) {
+                ProgressView()
+                Text(started, style: .timer).font(.callout).monospacedDigit().foregroundStyle(.secondary)
+            }
             Button("Cancel", action: cancel).buttonStyle(.bordered)
         }
         .padding(32)

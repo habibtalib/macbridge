@@ -160,25 +160,103 @@ private struct ConnectBar: View {
 
 // MARK: - Devices
 
+private enum DeviceFilter: String, CaseIterable, Identifiable {
+    case all, online, favourites
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: return "All"
+        case .online: return "Online"
+        case .favourites: return "Favourites"
+        }
+    }
+}
+
 private struct DeviceGrid: View {
     @EnvironmentObject private var model: BridgeModel
     let query: String
+    @State private var filter: DeviceFilter = .all
+
+    private var filteredByQuery: [PairedDevice] {
+        ConnectInput.filter(model.controllableSorted, query, names: model.displayNames)
+    }
+
+    private var onlineCount: Int {
+        model.controllable.filter { model.presence[$0.id] == true }.count
+    }
+
+    private var favouriteCount: Int {
+        model.controllable.filter { model.meta[$0.id]?.isFavourite == true }.count
+    }
 
     private var devices: [PairedDevice] {
-        ConnectInput.filter(model.controllableSorted, query, names: model.displayNames)
+        let base: [PairedDevice]
+        switch filter {
+        case .all: base = filteredByQuery
+        case .online: base = filteredByQuery.filter { model.presence[$0.id] == true }
+        case .favourites: base = filteredByQuery.filter { model.meta[$0.id]?.isFavourite == true }
+        }
+        // Keep favourites first, then online Macs before offline ones.
+        return base.sorted { a, b in
+            let fa = model.meta[a.id]?.isFavourite == true
+            let fb = model.meta[b.id]?.isFavourite == true
+            if fa != fb { return fa }
+            let oa = model.presence[a.id] == true
+            let ob = model.presence[b.id] == true
+            if oa != ob { return oa }
+            return false
+        }
     }
 
     var body: some View {
         if model.controllable.isEmpty {
             EmptyDevices()
         } else {
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
-                    ForEach(devices) { device in
-                        DeviceTile(device: device)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    ForEach(DeviceFilter.allCases) { f in
+                        let count = f == .all ? model.controllable.count : f == .online ? onlineCount : favouriteCount
+                        Button { filter = f } label: {
+                            HStack(spacing: 4) {
+                                if f == .online {
+                                    Circle().fill(count > 0 ? Color.green : Color.secondary.opacity(0.4)).frame(width: 6, height: 6)
+                                } else if f == .favourites {
+                                    Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(filter == f ? .white : .yellow)
+                                }
+                                Text("\(f.title) (\(count))").font(.callout.weight(filter == f ? .semibold : .regular)).monospacedDigit()
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(filter == f ? Color.accentColor : Color.primary.opacity(0.06), in: Capsule())
+                            .foregroundStyle(filter == f ? .white : .primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                    Button { model.refreshPresence() } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise").font(.callout)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .disabled(model.signalingStatus != .online)
+                    .help("Refresh which Macs are online")
+                }
+
+                if devices.isEmpty {
+                    Text(filter == .online ? "No paired Macs are online right now."
+                         : filter == .favourites ? "No favourite Macs yet. Click the star on a tile to pin it."
+                         : "No paired Mac matches your search.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .padding(.top, 8)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
+                            ForEach(devices) { device in
+                                DeviceTile(device: device)
+                            }
+                        }
+                        .padding(.vertical, 2)
                     }
                 }
-                .padding(.vertical, 2)
             }
         }
     }
@@ -211,11 +289,13 @@ private struct DeviceTile: View {
     let device: PairedDevice
     @State private var hovering = false
     @State private var renaming = false
+    @State private var confirmingForget = false
     @State private var newName = ""
 
     private var meta: DeviceMeta { model.meta[device.id] ?? DeviceMeta() }
     private var isCalling: Bool { model.controllerStatus == .calling(device) }
     private var canConnect: Bool { model.signalingStatus == .online }
+    private var isOnline: Bool? { model.presence[device.id] }
 
     var body: some View {
         Button(action: { if isCalling { model.disconnect() } else { model.connect(to: device) } }) {
@@ -223,7 +303,7 @@ private struct DeviceTile: View {
                 preview
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        PresenceDot(online: model.presence[device.id])
+                        PresenceDot(online: isOnline)
                         Text(model.displayName(device)).font(.title3.weight(.semibold)).lineLimit(1)
                         Spacer(minLength: 0)
                         if meta.isFavourite { Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow) }
@@ -237,11 +317,11 @@ private struct DeviceTile: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(hovering && canConnect ? Color.accentColor : Color.primary.opacity(0.1), lineWidth: hovering && canConnect ? 2 : 1))
-            .shadow(color: .black.opacity(hovering ? 0.12 : 0.04), radius: hovering ? 8 : 3, y: 2)
+            .shadow(color: .black.opacity(hovering ? 0.14 : 0.04), radius: hovering ? 10 : 3, y: 2)
         }
         .buttonStyle(.plain)
         .disabled(!canConnect && !isCalling)
-        .opacity(canConnect || isCalling ? 1 : 0.6)
+        .opacity(canConnect || isCalling ? (isOnline == false ? 0.78 : 1) : 0.6)
         .onHover { hovering = $0 }
         .help(canConnect ? "Connect to \(model.displayName(device))" : "This Mac is offline")
         .contextMenu {
@@ -254,7 +334,7 @@ private struct DeviceTile: View {
                 NSPasteboard.general.setString(DeviceID.grouped(device.id), forType: .string)
             }
             Divider()
-            Button("Forget \(model.displayName(device))", role: .destructive) { model.forget(device) }
+            Button("Forget \(model.displayName(device))…", role: .destructive) { confirmingForget = true }
         }
         .alert("Rename \(device.name)", isPresented: $renaming) {
             TextField("Name", text: $newName)
@@ -262,6 +342,12 @@ private struct DeviceTile: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The name is used on this Mac only. Leave it empty to use the Mac's own name.")
+        }
+        .alert("Forget \(model.displayName(device))?", isPresented: $confirmingForget) {
+            Button("Forget", role: .destructive) { model.forget(device) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You'll need a new pairing code from \(model.displayName(device)) to control it again.")
         }
     }
 
@@ -281,6 +367,31 @@ private struct DeviceTile: View {
                     }
                 }
             }
+            .overlay(alignment: .topLeading) {
+                if let online = isOnline {
+                    HStack(spacing: 4) {
+                        Circle().fill(online ? Color.green : Color.secondary).frame(width: 6, height: 6)
+                        Text(online ? "Online" : "Offline").font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(8)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if hovering || meta.isFavourite {
+                    Button { model.setFavourite(device, !meta.isFavourite) } label: {
+                        Image(systemName: meta.isFavourite ? "star.fill" : "star")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(meta.isFavourite ? .yellow : .white)
+                            .padding(6)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .help(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites")
+                }
+            }
             .overlay {
                 if isCalling {
                     ZStack {
@@ -290,6 +401,15 @@ private struct DeviceTile: View {
                             Text("Connecting… click to cancel").font(.caption).foregroundStyle(.white)
                         }
                     }
+                } else if hovering && canConnect {
+                    ZStack {
+                        Color.black.opacity(0.18)
+                        Label("Connect", systemImage: "play.fill")
+                            .font(.callout.weight(.semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .transition(.opacity)
                 }
             }
             .clipped()

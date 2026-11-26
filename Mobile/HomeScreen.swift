@@ -2,10 +2,23 @@ import BridgeCore
 import SwiftUI
 import VisionKit
 
+private enum MobileDeviceFilter: String, CaseIterable, Identifiable {
+    case all, online, favourites
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: return "All"
+        case .online: return "Online"
+        case .favourites: return "Favourites"
+        }
+    }
+}
+
 /// The Macs this device can control, and the way to add one.
 struct HomeScreen: View {
     @EnvironmentObject private var model: BridgeModel
     @State private var query = ""
+    @State private var filter: MobileDeviceFilter = .all
     @State private var showsSettings = false
     @State private var showsScanner = false
 
@@ -13,8 +26,26 @@ struct HomeScreen: View {
         ConnectInput.parse(query, devices: model.controllable, names: model.displayNames)
     }
     private var isOnline: Bool { model.signalingStatus == .online }
+    private var onlineCount: Int { model.controllable.filter { model.presence[$0.id] == true }.count }
+    private var favouriteCount: Int { model.controllable.filter { model.meta[$0.id]?.isFavourite == true }.count }
+
     private var devices: [PairedDevice] {
-        ConnectInput.filter(model.controllableSorted, query, names: model.displayNames)
+        let matched = ConnectInput.filter(model.controllableSorted, query, names: model.displayNames)
+        let filtered: [PairedDevice]
+        switch filter {
+        case .all: filtered = matched
+        case .online: filtered = matched.filter { model.presence[$0.id] == true }
+        case .favourites: filtered = matched.filter { model.meta[$0.id]?.isFavourite == true }
+        }
+        return filtered.sorted { a, b in
+            let fa = model.meta[a.id]?.isFavourite == true
+            let fb = model.meta[b.id]?.isFavourite == true
+            if fa != fb { return fa }
+            let oa = model.presence[a.id] == true
+            let ob = model.presence[b.id] == true
+            if oa != ob { return oa }
+            return false
+        }
     }
 
     var body: some View {
@@ -33,8 +64,17 @@ struct HomeScreen: View {
                     }
                     status
                     connectField
+                    if model.controllable.count > 1 {
+                        filterPills
+                    }
                     if model.controllable.isEmpty {
                         emptyState
+                    } else if devices.isEmpty {
+                        Text(filter == .online ? "No paired Macs are online right now."
+                             : filter == .favourites ? "No favourite Macs yet. Tap the star on a card to pin it."
+                             : "No paired Mac matches.")
+                            .font(.callout).foregroundStyle(.secondary)
+                            .padding(.top, 8)
                     } else {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 16)], spacing: 16) {
                             ForEach(devices) { DeviceCard(device: $0) }
@@ -52,12 +92,30 @@ struct HomeScreen: View {
             }
             .sheet(isPresented: $showsSettings) { SettingsScreen() }
             .sheet(isPresented: $showsScanner) {
-                CodeScanner { link in
-                    showsScanner = false
-                    query = link.code
-                    model.pair(using: link)
+                ZStack(alignment: .top) {
+                    CodeScanner { link in
+                        showsScanner = false
+                        query = link.code
+                        model.pair(using: link)
+                    }
+                    .ignoresSafeArea()
+                    HStack {
+                        Label("Point at the QR code on your Mac", systemImage: "qrcode.viewfinder")
+                            .font(.subheadline.weight(.medium))
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                        Spacer()
+                        Button { showsScanner = false } label: {
+                            Image(systemName: "xmark")
+                                .font(.headline)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .accessibilityLabel("Close scanner")
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 14)
                 }
-                .ignoresSafeArea()
             }
             .refreshable { model.refreshPresence() }
             .task(id: model.signalingStatus) {
@@ -135,6 +193,33 @@ struct HomeScreen: View {
         }
     }
 
+    private var filterPills: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(MobileDeviceFilter.allCases) { f in
+                    let count = f == .all ? model.controllable.count : f == .online ? onlineCount : favouriteCount
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        filter = f
+                    } label: {
+                        HStack(spacing: 5) {
+                            if f == .online {
+                                Circle().fill(count > 0 ? Color.green : Color.secondary.opacity(0.45)).frame(width: 7, height: 7)
+                            } else if f == .favourites {
+                                Image(systemName: "star.fill").font(.caption2).foregroundStyle(filter == f ? .white : .yellow)
+                            }
+                            Text("\(f.title) (\(count))").font(.subheadline.weight(filter == f ? .semibold : .regular)).monospacedDigit()
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(filter == f ? Color.accentColor : Color(uiColor: .secondarySystemBackground), in: Capsule())
+                        .foregroundStyle(filter == f ? .white : .primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("No Macs yet").font(.title3.weight(.semibold))
@@ -173,10 +258,12 @@ private struct DeviceCard: View {
     @EnvironmentObject private var model: BridgeModel
     let device: PairedDevice
     @State private var renaming = false
+    @State private var confirmingForget = false
     @State private var newName = ""
 
     private var meta: DeviceMeta { model.meta[device.id] ?? DeviceMeta() }
     private var canConnect: Bool { model.signalingStatus == .online }
+    private var isOnline: Bool? { model.presence[device.id] }
 
     var body: some View {
         Button { model.connect(to: device) } label: {
@@ -194,10 +281,36 @@ private struct DeviceCard: View {
                             }
                         }
                     }
+                    .overlay(alignment: .topLeading) {
+                        if let online = isOnline {
+                            HStack(spacing: 4) {
+                                Circle().fill(online ? Color.green : Color.secondary).frame(width: 7, height: 7)
+                                Text(online ? "Online" : "Offline").font(.caption2.weight(.semibold))
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(10)
+                        }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            model.setFavourite(device, !meta.isFavourite)
+                        } label: {
+                            Image(systemName: meta.isFavourite ? "star.fill" : "star")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(meta.isFavourite ? .yellow : .white)
+                                .padding(7)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(10)
+                        .accessibilityLabel(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites")
+                    }
                     .clipped()
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
-                        if let online = model.presence[device.id] {
+                        if let online = isOnline {
                             Circle().fill(online ? Color.green : Color.secondary.opacity(0.45)).frame(width: 9, height: 9)
                                 .accessibilityLabel(online ? "Online" : "Offline")
                         }
@@ -215,14 +328,17 @@ private struct DeviceCard: View {
         }
         .buttonStyle(.plain)
         .disabled(!canConnect)
-        .opacity(canConnect ? 1 : 0.6)
+        .opacity(canConnect ? (isOnline == false ? 0.78 : 1) : 0.6)
         .contextMenu {
             Button { model.connect(to: device) } label: { Label("Connect", systemImage: "play.fill") }.disabled(!canConnect)
             Button { newName = model.displayName(device); renaming = true } label: { Label("Rename", systemImage: "pencil") }
             Button { model.setFavourite(device, !meta.isFavourite) } label: {
                 Label(meta.isFavourite ? "Remove from Favourites" : "Add to Favourites", systemImage: meta.isFavourite ? "star.slash" : "star")
             }
-            Button(role: .destructive) { model.forget(device) } label: { Label("Forget", systemImage: "trash") }
+            Button { UIPasteboard.general.string = DeviceID.grouped(device.id) } label: {
+                Label("Copy Address", systemImage: "doc.on.doc")
+            }
+            Button(role: .destructive) { confirmingForget = true } label: { Label("Forget", systemImage: "trash") }
         }
         .alert("Rename \(device.name)", isPresented: $renaming) {
             TextField("Name", text: $newName)
@@ -230,6 +346,12 @@ private struct DeviceCard: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Used on this device only. Leave it empty to use the Mac's own name.")
+        }
+        .alert("Forget \(model.displayName(device))?", isPresented: $confirmingForget) {
+            Button("Forget", role: .destructive) { model.forget(device) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You'll need a new pairing code from \(model.displayName(device)) to control it again.")
         }
     }
 

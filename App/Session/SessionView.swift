@@ -29,18 +29,39 @@ struct SessionView: View {
     @EnvironmentObject private var model: BridgeModel
     let video: RemoteVideo
     let host: PairedDevice?
-    @State private var quality = QualityPreset.sharp
+    @AppStorage("qualityPreset") private var qualityRaw: Int = Int(QualityPreset.sharp.rawValue)
     @AppStorage("viewMode") private var viewMode = ViewMode.fit
     @State private var showsStats = false
+    @State private var toast: String?
+
+    private var quality: Binding<QualityPreset> {
+        Binding(
+            get: { QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp },
+            set: { qualityRaw = Int($0.rawValue) }
+        )
+    }
 
     private var videoSize: CGSize { model.remoteVideoSize ?? CGSize(width: 16, height: 10) }
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             Color.black
             screen
+            if let toast {
+                Text(toast)
+                    .font(.callout.weight(.medium))
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .shadow(color: .black.opacity(0.25), radius: 8, y: 2)
+                    .padding(.top, 14)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
         .frame(minWidth: 640, minHeight: 400)
+        .onAppear {
+            let preset = QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp
+            if preset != .sharp { model.sendInput(.quality(preset)) }
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button { showsStats.toggle() } label: {
@@ -67,6 +88,33 @@ struct SessionView: View {
             }
         }
         .onDisappear { Thumbnails.save(from: video, for: host?.id) }
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation(.snappy) { toast = text }
+        Task {
+            try? await Task.sleep(for: .seconds(2.2))
+            if toast == text { withAnimation(.easeOut) { toast = nil } }
+        }
+    }
+
+    private func saveScreenshot() {
+        guard let data = video.thumbnailJPEG(maxWidth: 4096) else {
+            showToast("No frame available yet")
+            return
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let hostSlug = (host.map(model.displayName) ?? "Mac").replacingOccurrences(of: "/", with: "-")
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+        if let file = desktop?.appendingPathComponent("MacBridge-\(hostSlug)-\(formatter.string(from: Date())).jpg") {
+            try? data.write(to: file, options: .atomic)
+        }
+        if let img = NSImage(data: data) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([img])
+        }
+        showToast("Screenshot saved to Desktop & copied")
     }
 
     // MARK: Screen
@@ -135,7 +183,7 @@ struct SessionView: View {
 
     private var qualityMenu: some View {
         Menu {
-            Picker("Quality", selection: $quality) {
+            Picker("Quality", selection: quality) {
                 Text("Sharp: full detail, 60 fps").tag(QualityPreset.sharp)
                 Text("Balanced: 30 fps").tag(QualityPreset.balanced)
                 Text("Light: smaller, 15 fps").tag(QualityPreset.light)
@@ -145,7 +193,11 @@ struct SessionView: View {
             Label("Quality", systemImage: "dial.medium")
         }
         .help("Lower the quality on a weak connection")
-        .onChange(of: quality) { _, preset in model.sendInput(.quality(preset)) }
+        .onChange(of: qualityRaw) { _, raw in
+            let preset = QualityPreset(rawValue: UInt8(raw)) ?? .sharp
+            model.sendInput(.quality(preset))
+            showToast(preset == .sharp ? "Quality: Sharp (60 fps)" : preset == .balanced ? "Quality: Balanced (30 fps)" : "Quality: Light (15 fps)")
+        }
     }
 
     private var actionsMenu: some View {
@@ -163,8 +215,12 @@ struct SessionView: View {
                 Button("Send Clipboard", systemImage: "doc.on.clipboard") {
                     if let text = InputMapping.clipboardText(NSPasteboard.general.string(forType: .string)) {
                         model.sendInput(.clipboard(text: text))
+                        showToast("Sent clipboard to remote Mac")
+                    } else {
+                        showToast("Clipboard has no text to send")
                     }
                 }
+                Button("Save Screenshot", systemImage: "camera") { saveScreenshot() }
                 Button("Lock Screen", systemImage: "lock") { model.sendShortcut(.lockScreen) }
             }
         } label: {
@@ -195,6 +251,7 @@ struct ConnectionChip: View {
 
     private var color: Color {
         guard let stats, let relayed = stats.isRelayed else { return .secondary }
+        if (stats.lossPercent ?? 0) > 2.0 { return .red }
         if let ms = stats.roundTripMs, ms > 150 { return .orange }
         return relayed ? .orange : .green
     }
@@ -204,6 +261,7 @@ struct ConnectionChip: View {
         var parts: [String] = []
         if let relayed = stats.isRelayed { parts.append(relayed ? "Relayed" : "Direct") }
         if let ms = stats.roundTripMs { parts.append("\(Int(ms.rounded())) ms") }
+        if stats.framesPerSecond > 0 { parts.append("\(Int(stats.framesPerSecond.rounded())) fps") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
@@ -248,12 +306,16 @@ struct StatsPanel: View {
 struct ConnectingView: View {
     let name: String
     let cancel: () -> Void
+    @State private var started = Date()
 
     var body: some View {
         VStack(spacing: 14) {
             Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 88, height: 88).accessibilityHidden(true)
             Text("Connecting to \(name)…").font(.title2.weight(.semibold))
-            ProgressView().controlSize(.small)
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(started, style: .timer).font(.callout).monospacedDigit().foregroundStyle(.secondary)
+            }
             Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

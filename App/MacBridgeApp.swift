@@ -151,6 +151,17 @@ private struct MenuBarContent: View {
             .disabled(model.signalingStatus != .online)
         }
         Toggle("Allow This Mac to Be Controlled", isOn: $model.allowsControl)
+        Button("Copy This Mac's Address") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(DeviceID.grouped(model.deviceID), forType: .string)
+        }
+        if model.allowsControl, model.signalingStatus == .online {
+            Button("Show Pairing Code") {
+                openWindow(id: "main")
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                model.showPairingCode()
+            }
+        }
         Divider()
         Button("Quit MacBridge") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")

@@ -7,10 +7,17 @@ struct SessionScreen: View {
     let video: RemoteVideo
     let host: PairedDevice
     @StateObject private var input: SessionInput
-    @State private var quality = QualityPreset.sharp
+    @AppStorage("qualityPreset") private var qualityRaw: Int = Int(QualityPreset.sharp.rawValue)
     @State private var barCollapsed = false
     @State private var showsStats = false
     @State private var note: String?
+
+    private var quality: Binding<QualityPreset> {
+        Binding(
+            get: { QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp },
+            set: { qualityRaw = Int($0.rawValue) }
+        )
+    }
 
     init(video: RemoteVideo, host: PairedDevice) {
         self.video = video
@@ -30,25 +37,39 @@ struct SessionScreen: View {
             controlBar
                 .padding(.top, 6)
             if let note {
-                Text(note).font(.callout).padding(.horizontal, 14).padding(.vertical, 8)
+                Text(note).font(.callout.weight(.medium)).padding(.horizontal, 14).padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(.top, 64)
                     .transition(.opacity)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if input.keyboardVisible { KeyBar(input: input) }
+            if input.keyboardVisible {
+                KeyBar(input: input, onPasteFromDevice: {
+                    if let text = InputMapping.clipboardText(UIPasteboard.general.string) {
+                        model.sendInput(.clipboard(text: text))
+                        input.press(9, holding: .command)
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        show("Pasted from this device")
+                    } else {
+                        show("Clipboard is empty")
+                    }
+                })
+            }
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
         .onAppear {
             input.send = { [weak model] in model?.sendInput($0) }
+            let preset = QualityPreset(rawValue: UInt8(qualityRaw)) ?? .sharp
+            if preset != .sharp { model.sendInput(.quality(preset)) }
         }
         .onDisappear {
             Thumbnails.save(from: video, for: host.id)
         }
         .onChange(of: input.mode) { _, mode in
             UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode")
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
             show(mode == .trackpad ? "Trackpad: drag to move, tap to click" : "Touch: tap where you want to click")
         }
         .sheet(isPresented: $showsStats) { StatsSheet(name: model.displayName(host)) }
@@ -64,9 +85,28 @@ struct SessionScreen: View {
 
     // MARK: Control bar
 
+    private var healthColor: Color {
+        guard let stats = model.sessionStats else { return .secondary }
+        if (stats.lossPercent ?? 0) > 2.0 { return .red }
+        if let ms = stats.roundTripMs, ms > 150 { return .orange }
+        return stats.isRelayed == true ? .orange : .green
+    }
+
     private var controlBar: some View {
         HStack(spacing: 4) {
             if !barCollapsed {
+                Button { showsStats = true } label: {
+                    HStack(spacing: 5) {
+                        Circle().fill(healthColor).frame(width: 7, height: 7)
+                        if let ms = model.sessionStats?.roundTripMs {
+                            Text("\(Int(ms.rounded()))ms").font(.caption.weight(.semibold)).monospacedDigit()
+                        }
+                    }
+                    .padding(.horizontal, 8).frame(height: 36)
+                    .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Connection details")
+
                 barButton("Keyboard", input.keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard") { input.toggleKeyboard() }
                 barButton(input.mode == .trackpad ? "Switch to touch" : "Switch to trackpad",
                           input.mode == .trackpad ? "rectangle.and.hand.point.up.left" : "hand.tap") {
@@ -109,12 +149,22 @@ struct SessionScreen: View {
             Section("Mac") {
                 Button { model.sendShortcut(.spotlight) } label: { Label("Spotlight", systemImage: "magnifyingglass") }
                 Button { model.sendShortcut(.appSwitcher) } label: { Label("Switch App", systemImage: "square.on.square") }
+                Button {
+                    if let data = video.thumbnailJPEG(maxWidth: 4096), let image = UIImage(data: data) {
+                        UIPasteboard.general.image = image
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        show("Screenshot copied to clipboard")
+                    } else {
+                        show("No frame available yet")
+                    }
+                } label: { Label("Copy Screenshot", systemImage: "camera") }
                 Button { model.sendShortcut(.lockScreen) } label: { Label("Lock Screen", systemImage: "lock") }
             }
             Section("Clipboard") {
                 Button {
                     if let text = InputMapping.clipboardText(UIPasteboard.general.string) {
                         model.sendInput(.clipboard(text: text))
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         show("Sent to the Mac's clipboard")
                     } else {
                         show("Nothing to send")
@@ -123,13 +173,14 @@ struct SessionScreen: View {
                 Button {
                     if let text = model.hostClipboardText {
                         UIPasteboard.general.string = text
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         show("Copied from the Mac")
                     } else {
                         show("Nothing copied on the Mac yet")
                     }
                 } label: { Label("Get Mac's Clipboard", systemImage: "arrow.down.doc") }
             }
-            Picker("Quality", selection: $quality) {
+            Picker("Quality", selection: quality) {
                 Text("Sharp").tag(QualityPreset.sharp)
                 Text("Balanced").tag(QualityPreset.balanced)
                 Text("Light").tag(QualityPreset.light)
@@ -138,7 +189,11 @@ struct SessionScreen: View {
             Button { showsStats = true } label: { Label("Connection Details", systemImage: "waveform.path.ecg") }
         } label: { barIcon("ellipsis.circle") }
         .accessibilityLabel("More")
-        .onChange(of: quality) { _, preset in model.sendInput(.quality(preset)) }
+        .onChange(of: qualityRaw) { _, raw in
+            let preset = QualityPreset(rawValue: UInt8(raw)) ?? .sharp
+            model.sendInput(.quality(preset))
+            show(preset == .sharp ? "Quality: Sharp" : preset == .balanced ? "Quality: Balanced" : "Quality: Light")
+        }
     }
 
     private func barIcon(_ symbol: String, tint: Color = .primary) -> some View {
@@ -155,6 +210,7 @@ struct SessionScreen: View {
 /// Keys the on-screen keyboard does not have, shown above it.
 private struct KeyBar: View {
     @ObservedObject var input: SessionInput
+    let onPasteFromDevice: () -> Void
 
     private let modifiers: [(String, WireModifiers)] = [("⌘", .command), ("⌥", .option), ("⌃", .control), ("⇧", .shift)]
 
@@ -163,26 +219,46 @@ private struct KeyBar: View {
             HStack(spacing: 6) {
                 ForEach(modifiers, id: \.0) { title, modifier in
                     key(title, on: input.sticky.contains(modifier)) {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         if input.sticky.contains(modifier) { input.sticky.remove(modifier) } else { input.sticky.insert(modifier) }
                     }
                     .accessibilityLabel("Hold \(title) for the next key")
                 }
                 Divider().frame(height: 24)
-                key("esc") { input.press(MacKey.escape) }
-                key("tab") { input.press(MacKey.tab) }
-                key("←") { input.press(MacKey.leftArrow) }
-                key("↓") { input.press(MacKey.downArrow) }
-                key("↑") { input.press(MacKey.upArrow) }
-                key("→") { input.press(MacKey.rightArrow) }
+                key("esc") { tap(MacKey.escape) }
+                key("tab") { tap(MacKey.tab) }
+                key("⌫") { tap(MacKey.delete) }
+                key("↩") { tap(MacKey.returnKey) }
+                key("←") { tap(MacKey.leftArrow) }
+                key("↓") { tap(MacKey.downArrow) }
+                key("↑") { tap(MacKey.upArrow) }
+                key("→") { tap(MacKey.rightArrow) }
                 Divider().frame(height: 24)
-                key("⌘C") { input.press(8, holding: .command) }
-                key("⌘V") { input.press(9, holding: .command) }
-                key("⌘Z") { input.press(6, holding: .command) }
-                key("⌘A") { input.press(0, holding: .command) }
+                Button(action: onPasteFromDevice) {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 15, weight: .medium))
+                        .frame(minWidth: 40, minHeight: 36).padding(.horizontal, 4)
+                        .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .foregroundStyle(Color.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Paste from this device")
+                key("⌃C") { tap(8, holding: .control) }
+                key("⌘C") { tap(8, holding: .command) }
+                key("⌘V") { tap(9, holding: .command) }
+                key("⌘Z") { tap(6, holding: .command) }
+                key("⌘A") { tap(0, holding: .command) }
+                key("⌘W") { tap(13, holding: .command) }
+                key("⌘T") { tap(17, holding: .command) }
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
         }
         .background(.bar)
+    }
+
+    private func tap(_ keyCode: UInt16, holding: WireModifiers = []) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        input.press(keyCode, holding: holding)
     }
 
     private func key(_ title: String, on: Bool = false, action: @escaping () -> Void) -> some View {
