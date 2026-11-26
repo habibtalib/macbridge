@@ -48,7 +48,7 @@ enum Snapshot {
                 try? jpeg.write(to: Thumbnails.url(for: devices[0].id))
             }
         }
-        defaults.set("Dark-MBP", forKey: "deviceName")
+        defaults.set("Studio", forKey: "deviceName")
         defaults.set("wss://bridge.example.com", forKey: "serverURL")
         defaults.set(true, forKey: "allowsControl")
         // A keeper that runs nothing: a snapshot must not touch the Mac's sleep setting.
