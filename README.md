@@ -4,6 +4,23 @@ Control one Mac from another, from anywhere. One app on both Macs; a small serve
 
 Status: early; used between Macs on a private network (Tailscale), not yet tried over the open internet. Working name.
 
+## Install on a Mac
+
+Needs macOS 15 or later on Apple silicon, on both Macs.
+
+1. Download `MacBridge-<version>.zip` from [Releases](https://github.com/habibtalib/macbridge/releases) and double-click it to unzip.
+2. Move `MacBridge.app` to `/Applications`.
+3. The release is signed with a development certificate and is not notarised, so macOS blocks the first launch. Clear the download flag once in Terminal:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/MacBridge.app
+   ```
+
+   Or open it, click **Done** on the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
+4. Open MacBridge and continue with [Set up](#set-up): a signaling server, then pairing.
+
+On the Mac to be controlled, macOS asks for **Screen Recording** and **Accessibility**. Grant both in **Settings → Security**, then reopen the app. If you later replace the app with a build signed by someone else, remove MacBridge from both lists and grant again.
+
 ## Layout
 
 | Path | What |
@@ -18,12 +35,13 @@ Status: early; used between Macs on a private network (Tailscale), not yet tried
 Requires Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node 24+ and pnpm.
 
 ```sh
+export DEVELOPMENT_TEAM=XXXXXXXXXX   # your Apple team ID (Xcode → Settings → Accounts)
 xcodegen generate
 xcodebuild -project MacBridge.xcodeproj -scheme MacBridge -derivedDataPath build build
 open build/Build/Products/Debug/MacBridge.app
 ```
 
-Builds are signed with a development identity (`DEVELOPMENT_TEAM` in `project.yml`). macOS ties the Screen Recording and Accessibility grants to the signature, so do not switch to ad-hoc signing.
+Builds are signed with your development identity; `project.yml` reads the team ID from `DEVELOPMENT_TEAM`. macOS ties the Screen Recording and Accessibility grants to the signature, so do not switch to ad-hoc signing. `scripts/package.sh` makes a Release zip in `dist/`; with `NOTARY_PROFILE` and a Developer ID certificate it also notarises.
 
 ## Set up
 
@@ -33,7 +51,7 @@ Builds are signed with a development identity (`DEVELOPMENT_TEAM` in `project.ym
    cd server && pnpm install && ALLOW_NO_TOKEN=1 pnpm start
    ```
 
-2. **Both Macs.** Copy the app over (`scripts/package.sh` makes `dist/MacBridge-<version>.zip`). In **Settings (⌘,) → Connection** enter the server (`wss://bridge.example.com`, or `ws://<ip>:8787` for the quick test) and the access token, then **Go online**.
+2. **Both Macs.** Copy the app over (download it from Releases, or `scripts/package.sh` makes `dist/MacBridge-<version>.zip`). In **Settings (⌘,) → Connection** enter the server (`wss://bridge.example.com`, or `ws://<ip>:8787` for the quick test) and the access token, then **Go online**.
 3. **The Mac to be controlled.** In the main window turn on **Allow control**. In **Settings → Security** allow Screen Recording and Accessibility, then reopen the app. In **Settings → General** turn on **Open MacBridge at login**. Back in the main window click **Show pairing code**.
 4. **The Mac you control from.** Type the code into **Connect to a Mac** and click **Pair**. The Mac appears as a tile; click it to connect.
 
@@ -106,3 +124,7 @@ cd server && pnpm test && pnpm typecheck
 ```
 
 The WebRTC loopback test runs a host and a controller in one process and checks hardware H.264 video and both input channels end to end. The client ↔ server tests need `server/node_modules`.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Changes per release are in [CHANGELOG.md](CHANGELOG.md).

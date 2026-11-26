@@ -6,7 +6,7 @@ import Testing
     private let code = PairingCode().display
 
     @Test func roundTripsCodeAndServer() throws {
-        let link = PairingLink(code: code, server: "ws://100.77.252.76:8787")
+        let link = PairingLink(code: code, server: "ws://100.64.0.1:8787")
         let text = try #require(link.url?.absoluteString)
         #expect(text.hasPrefix("macbridge://pair?"))
         #expect(PairingLink(text) == link)

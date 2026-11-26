@@ -11,10 +11,11 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "4"
+    CURRENT_PROJECT_VERSION: "5"
     # Screen Recording and Accessibility grants are tied to the code signature,
     # so builds must be signed with a stable identity, never ad hoc.
-    DEVELOPMENT_TEAM: 66G227SMR5
+    # Your Apple team ID, from the environment: DEVELOPMENT_TEAM=XXXXXXXXXX xcodegen generate
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
 targets:

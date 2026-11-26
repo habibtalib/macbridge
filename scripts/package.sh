@@ -1,13 +1,15 @@
 #!/bin/bash
 # Builds a Release copy of MacBridge and zips it for copying to another Mac.
 #
-#   scripts/package.sh                 # development-signed zip in dist/
+#   DEVELOPMENT_TEAM=XXXXXXXXXX scripts/package.sh   # development-signed zip in dist/
 #   NOTARY_PROFILE=name scripts/package.sh
 #       also notarises and staples; needs a "Developer ID Application"
 #       certificate and a keychain profile made with
 #       `xcrun notarytool store-credentials <name>`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+: "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM to your Apple team ID}"
 
 xcodegen generate >/dev/null
 args=(-project MacBridge.xcodeproj -scheme MacBridge -configuration Release

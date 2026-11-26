@@ -3,7 +3,7 @@
 # same signaling server, and pairs them so THIS Mac can control THAT one.
 #
 #   scripts/link-remote.sh <user@host> <server-url>
-#   scripts/link-remote.sh habibtalib@habibs-mac-mini ws://100.77.252.76:8787
+#   scripts/link-remote.sh me@mac-mini ws://100.64.0.1:8787
 #
 # Pairing here skips the on-screen code: being able to write both users'
 # settings already proves you own both Macs. Screen Recording and

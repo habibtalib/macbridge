@@ -3,7 +3,7 @@
 # CONTROLLER can control HOST. Each is `user@host` for SSH, or `local` for this Mac.
 #
 #   scripts/pair-ssh.sh <controller> <host>
-#   scripts/pair-ssh.sh habib@macbook-air-1 local          # the Air can control this Mac
+#   scripts/pair-ssh.sh me@macbook-air local             # the Air can control this Mac
 #
 # Being able to write both users' settings already proves you own both Macs.
 # MacBridge is restarted on both.
