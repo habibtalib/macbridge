@@ -25,8 +25,8 @@ public enum InputMessage: Equatable, Sendable {
     /// messages are limited in size.
     public static let maxClipboardBytes = 100_000
 
-    /// Pointer moves and scrolls go on the unordered, no-retransmit channel:
-    /// a late one is worthless, so it is dropped rather than queued.
+    /// Pointer moves and scrolls go on the no-retransmit channel: a lost one
+    /// is worthless by the time it could be resent, so it is skipped.
     public var prefersUnreliableChannel: Bool {
         switch self {
         case .mouseMove, .scroll: return true

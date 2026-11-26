@@ -60,9 +60,10 @@ final class Launch: ObservableObject {
         if let model, model.canGoOnline { model.goOnline() }
         panels = model.map(HostPanels.init)
         if let model {
-            // A hold on lid-close sleep must not outlive the app.
+            // Neither a session, with keys the controller holds down, nor a hold on
+            // lid-close sleep may outlive the app.
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
-                MainActor.assumeIsolated { model.releaseLidHold() }
+                MainActor.assumeIsolated { model.prepareForQuit() }
             }
         }
     }

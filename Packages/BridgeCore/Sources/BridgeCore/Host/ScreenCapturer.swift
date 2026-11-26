@@ -25,16 +25,57 @@ public enum ScreenCaptureError: Error, Equatable {
     case noDisplay
 }
 
+/// Which stream is the current one. Every start and stop moves on to a new
+/// generation, so a start still waiting on ScreenCaptureKit when another start
+/// or a stop comes in cannot install its stream afterwards.
+struct StreamSlot<Stream: AnyObject> {
+    private(set) var current: Stream?
+    private(set) var generation = 0
+
+    /// A start or stop begins. Returns its generation and the stream it takes
+    /// over, which the caller stops.
+    mutating func advance() -> (generation: Int, previous: Stream?) {
+        generation += 1
+        defer { current = nil }
+        return (generation, current)
+    }
+
+    /// The stream a start produced becomes current only if nothing came after
+    /// that start. False: the caller stops it again.
+    mutating func install(_ stream: Stream, generation: Int) -> Bool {
+        guard generation == self.generation else { return false }
+        current = stream
+        return true
+    }
+
+    func isCurrent(_ stream: Stream) -> Bool { current === stream }
+
+    /// The system stopped `stream`. True if it was the current one, which is
+    /// then cleared; a stream already replaced or stopped on purpose is ignored.
+    mutating func remove(_ stream: Stream) -> Bool {
+        guard current === stream else { return false }
+        current = nil
+        return true
+    }
+}
+
 /// Captures one display with ScreenCaptureKit and hands out frames ready for
 /// the video encoder.
 public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    /// Called on a private queue for every new frame.
-    public var onFrame: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)?
-    /// Called if the system stops the stream (permission revoked, display unplugged).
+    /// Called on a private queue for every new frame. Changes are applied on
+    /// that queue, in the order they were made.
+    public var onFrame: ((CVPixelBuffer, _ timestampNs: Int64) -> Void)? {
+        get { frameQueue.sync { frameHandler } }
+        set { frameQueue.async { self.frameHandler = newValue } }
+    }
+    /// Called if the system stops the current stream (permission revoked, display unplugged).
+    /// Set it once, before the first start.
     public var onStop: ((Error?) -> Void)?
 
     private let frameQueue = DispatchQueue(label: "macbridge.capture", qos: .userInteractive)
-    private var stream: SCStream?
+    // Guarded by `frameQueue`.
+    private var frameHandler: ((CVPixelBuffer, Int64) -> Void)?
+    private var slot = StreamSlot<SCStream>()
     /// ScreenCaptureKit sends nothing while the screen is still. The last
     /// frame is sent again on a timer so the viewer never waits on a lost or
     /// not-yet-sent first frame (a black picture until something moves).
@@ -56,9 +97,11 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         try await shareableDisplays().map(info(for:))
     }
 
-    /// Starts capturing. `displayID == nil` means the main display.
+    /// Starts capturing, replacing any stream already running.
+    /// `displayID == nil` means the main display.
     /// Frames are scaled down, keeping the aspect ratio, so that neither side
     /// exceeds `maxPixelWidth` × `maxPixelHeight`.
+    /// Throws `CancellationError` if `stop()` or another start came in meanwhile.
     @discardableResult
     public func start(
         displayID: CGDirectDisplayID? = nil,
@@ -66,7 +109,8 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         maxPixelHeight: Int = 1600,
         framesPerSecond: Int = 60
     ) async throws -> DisplayInfo {
-        await stop()
+        let (generation, previous) = frameQueue.sync { detachLocked() }
+        try? await previous?.stopCapture()
         let displays = try await Self.shareableDisplays()
         let wanted = displayID ?? CGMainDisplayID()
         guard let display = displays.first(where: { $0.displayID == wanted }) ?? displays.first else {
@@ -89,49 +133,60 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         try await stream.startCapture()
-        self.stream = stream
-        startRepeating()
+        let installed = frameQueue.sync { () -> Bool in
+            guard slot.install(stream, generation: generation) else { return false }
+            startRepeatingLocked()
+            return true
+        }
+        guard installed else {
+            // Stopped or replaced while starting: this stream must not keep running unowned.
+            try? await stream.stopCapture()
+            throw CancellationError()
+        }
         return info
     }
 
+    /// Stops the current stream, and any start still in progress.
     public func stop() async {
-        guard let stream else { return }
-        self.stream = nil
-        frameQueue.sync {
-            repeatTimer?.cancel()
-            repeatTimer = nil
-            lastFrame = nil
-        }
-        try? await stream.stopCapture()
+        let (_, previous) = frameQueue.sync { detachLocked() }
+        try? await previous?.stopCapture()
+    }
+
+    /// On `frameQueue`. Moves to a new generation and takes the current stream
+    /// out, with its repeat timer and held frame.
+    private func detachLocked() -> (generation: Int, previous: SCStream?) {
+        repeatTimer?.cancel()
+        repeatTimer = nil
+        lastFrame = nil
+        return slot.advance()
     }
 
     // MARK: - SCStreamOutput / SCStreamDelegate
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid, Self.isCompleteFrame(sampleBuffer),
+        // On `frameQueue`. A stream being stopped may still deliver a frame or two.
+        guard type == .screen, slot.isCurrent(stream), sampleBuffer.isValid, Self.isCompleteFrame(sampleBuffer),
               let pixelBuffer = sampleBuffer.imageBuffer else { return }
         let seconds = sampleBuffer.presentationTimeStamp.seconds
         lastFrame = pixelBuffer
         lastFrameAt = Self.hostSeconds()
-        onFrame?(pixelBuffer, Int64(seconds * 1_000_000_000))
+        frameHandler?(pixelBuffer, Int64(seconds * 1_000_000_000))
     }
 
     /// On `frameQueue`, like the stream output, so the two never race.
-    private func startRepeating() {
-        frameQueue.sync {
-            repeatTimer?.cancel()
-            let timer = DispatchSource.makeTimerSource(queue: frameQueue)
-            timer.schedule(deadline: .now() + Self.repeatInterval, repeating: Self.repeatInterval)
-            timer.setEventHandler { [weak self] in
-                guard let self, let frame = self.lastFrame else { return }
-                let now = Self.hostSeconds()
-                guard now - self.lastFrameAt >= Self.repeatInterval else { return }
-                self.lastFrameAt = now
-                self.onFrame?(frame, Int64(now * 1_000_000_000))
-            }
-            repeatTimer = timer
-            timer.resume()
+    private func startRepeatingLocked() {
+        repeatTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: frameQueue)
+        timer.schedule(deadline: .now() + Self.repeatInterval, repeating: Self.repeatInterval)
+        timer.setEventHandler { [weak self] in
+            guard let self, let frame = self.lastFrame else { return }
+            let now = Self.hostSeconds()
+            guard now - self.lastFrameAt >= Self.repeatInterval else { return }
+            self.lastFrameAt = now
+            self.frameHandler?(frame, Int64(now * 1_000_000_000))
         }
+        repeatTimer = timer
+        timer.resume()
     }
 
     /// The host clock, the one ScreenCaptureKit stamps its frames with.
@@ -140,8 +195,14 @@ public final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate, @
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        self.stream = nil
-        onStop?(error)
+        frameQueue.async {
+            // Only the current stream ends the session; an old one stopped on purpose does not.
+            guard self.slot.remove(stream) else { return }
+            self.repeatTimer?.cancel()
+            self.repeatTimer = nil
+            self.lastFrame = nil
+            self.onStop?(error)
+        }
     }
 
     // MARK: - Helpers

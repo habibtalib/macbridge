@@ -30,12 +30,13 @@ public final class ScreenCapturer: @unchecked Sendable {
 }
 
 public final class InputInjector: @unchecked Sendable {
-    public init(display: DisplayInfo) {}
+    public init(display: DisplayInfo, writeClipboard: @escaping (String) -> Void = { _ in }) {}
     public static var hasPermission: Bool { false }
     @discardableResult public static func requestPermission() -> Bool { false }
     public func setDisplay(_ display: DisplayInfo) {}
     public func handle(_ message: InputMessage) {}
     public func releaseAll() {}
+    public func stop(waitUntilDone: Bool = false) {}
 }
 
 @MainActor
@@ -55,6 +56,11 @@ public final class VirtualDisplay {
 
 public enum Headless {
     public static func needsVirtualDisplay() -> Bool { false }
+    public static func needsVirtualDisplay(ignoring id: CGDirectDisplayID?) -> Bool { false }
+}
+
+public final class DisplayChangeWatcher {
+    public init(onChange: @escaping () -> Void) {}
 }
 
 public enum LidAndPower {

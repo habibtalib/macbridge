@@ -77,3 +77,60 @@ import Testing
         #expect(again.lidClosedMode == .always)
     }
 }
+
+@Suite struct PmsetParsingTests {
+    /// `pmset -g` as printed on macOS 15, columns lined up with tabs and spaces.
+    private let sample = """
+    System-wide power settings:
+     SleepDisabled\t\t1
+    Currently in use:
+     standby              1
+     Sleep On Power Button 1
+     hibernatefile        /var/vm/sleepimage
+     displaysleep         10
+     sleep                1 (sleep prevented by powerd)
+    """
+
+    @Test func readsSleepDisabledSeparatedByTabs() {
+        #expect(LidAndPower.sleepDisabled(pmsetOutput: sample))
+    }
+
+    @Test func readsSleepDisabledSeparatedBySpaces() {
+        #expect(LidAndPower.sleepDisabled(pmsetOutput: " SleepDisabled  1\n"))
+    }
+
+    @Test func zeroOrMissingIsNotDisabled() {
+        #expect(!LidAndPower.sleepDisabled(pmsetOutput: sample.replacingOccurrences(of: "SleepDisabled\t\t1", with: "SleepDisabled\t\t0")))
+        #expect(!LidAndPower.sleepDisabled(pmsetOutput: "Currently in use:\n sleep\t1\n"))
+        #expect(!LidAndPower.sleepDisabled(pmsetOutput: ""))
+    }
+
+    @Test func otherSettingsEndingInOneDoNotCount() {
+        // "sleep 1" and "Sleep On Power Button 1" end in 1 but are not SleepDisabled.
+        #expect(!LidAndPower.sleepDisabled(pmsetOutput: " Sleep On Power Button 1\n sleep\t\t1\n"))
+    }
+}
+
+@MainActor @Suite struct LidClosedKeeperPmsetTests {
+    /// With no answer given, pmset is read off the main actor and the hold begins after it.
+    @Test(.timeLimit(.minutes(1))) func holdBeginsAfterPmsetAnswers() async throws {
+        var calls: [[String]] = []
+        let keeper = LidClosedKeeper(run: { calls.append($0) })
+        keeper.update(shouldHold: true)
+        for _ in 0..<100 where calls.isEmpty {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(calls.first == ["keepalive", "15m", "--reason", "MacBridge"])
+        #expect(keeper.isHolding)
+    }
+
+    @Test(.timeLimit(.minutes(1))) func noHoldIfReleasedWhilePmsetRuns() async throws {
+        var calls: [[String]] = []
+        let keeper = LidClosedKeeper(run: { calls.append($0) })
+        keeper.update(shouldHold: true)
+        keeper.update(shouldHold: false)
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        #expect(calls.isEmpty)
+        #expect(!keeper.isHolding)
+    }
+}

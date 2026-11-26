@@ -26,20 +26,70 @@ public struct InputCaptureView: NSViewRepresentable {
     public final class CaptureView: NSView {
         var send: (InputMessage) -> Void = { _ in }
         private var trackingArea: NSTrackingArea?
+        /// What the host was told is held down. Released when this view loses the
+        /// keyboard, or the up event would go to another app and the host would keep it pressed.
+        private var keysDown: Set<UInt16> = []
+        private var buttonsDown: Set<MouseButton> = []
+        private var lastPosition: (x: Float, y: Float) = (0.5, 0.5)
+        private var keyUpMonitor: Any?
 
         public override var acceptsFirstResponder: Bool { true }
         public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        deinit {
+            if let keyUpMonitor { NSEvent.removeMonitor(keyUpMonitor) }
+            releaseHeld()
+        }
 
         public override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             NotificationCenter.default.removeObserver(self)
             releaseSystemShortcuts()
+            releaseHeld()
+            removeKeyUpMonitor()
             guard let window else { return }
             window.acceptsMouseMovedEvents = true
             window.makeFirstResponder(self)
             NotificationCenter.default.addObserver(self, selector: #selector(windowBecameKey), name: NSWindow.didBecomeKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowResignedKey), name: NSWindow.didResignKeyNotification, object: window)
             if window.isKeyWindow { takeSystemShortcuts() }
+            installKeyUpMonitor()
+        }
+
+        public override func resignFirstResponder() -> Bool {
+            releaseHeld()
+            return super.resignFirstResponder()
+        }
+
+        /// Sends the release of every key and button still held.
+        private func releaseHeld() {
+            for keyCode in keysDown {
+                send(.key(keyCode: keyCode, isDown: false, modifiers: 0))
+            }
+            keysDown.removeAll()
+            for button in buttonsDown {
+                send(.mouseButton(button: button, isDown: false, x: lastPosition.x, y: lastPosition.y, clickCount: 1))
+            }
+            buttonsDown.removeAll()
+        }
+
+        /// A key pressed with ⌘ goes through `performKeyEquivalent`, and AppKit
+        /// then never calls `keyUp`: the host would see ⌘C as C held down. The
+        /// monitor sees the key-up before AppKit drops it.
+        private func installKeyUpMonitor() {
+            guard keyUpMonitor == nil else { return }
+            keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
+                guard let self, let window = self.window, event.window === window,
+                      window.firstResponder === self, self.keysDown.contains(event.keyCode) else { return event }
+                self.key(event, isDown: false)
+                return nil
+            }
+        }
+
+        private func removeKeyUpMonitor() {
+            guard let keyUpMonitor else { return }
+            NSEvent.removeMonitor(keyUpMonitor)
+            self.keyUpMonitor = nil
         }
 
         // MARK: System shortcuts
@@ -51,7 +101,10 @@ public struct InputCaptureView: NSViewRepresentable {
         private var shortcutToken: UnsafeMutableRawPointer?
 
         @objc private func windowBecameKey() { takeSystemShortcuts() }
-        @objc private func windowResignedKey() { releaseSystemShortcuts() }
+        @objc private func windowResignedKey() {
+            releaseSystemShortcuts()
+            releaseHeld()
+        }
 
         private func takeSystemShortcuts() {
             guard shortcutToken == nil else { return }
@@ -104,11 +157,14 @@ public struct InputCaptureView: NSViewRepresentable {
 
         private func move(_ event: NSEvent) {
             let (x, y) = InputMapping.normalized(convert(event.locationInWindow, from: nil), in: bounds.size)
+            lastPosition = (x, y)
             send(.mouseMove(x: x, y: y))
         }
 
         private func button(_ button: MouseButton, isDown: Bool, _ event: NSEvent) {
             let (x, y) = InputMapping.normalized(convert(event.locationInWindow, from: nil), in: bounds.size)
+            lastPosition = (x, y)
+            if isDown { buttonsDown.insert(button) } else { buttonsDown.remove(button) }
             let clicks = UInt8(clamping: max(1, event.clickCount))
             send(.mouseButton(button: button, isDown: isDown, x: x, y: y, clickCount: clicks))
         }
@@ -139,6 +195,7 @@ public struct InputCaptureView: NSViewRepresentable {
                let text = InputMapping.clipboardText(NSPasteboard.general.string(forType: .string)) {
                 send(.clipboard(text: text))
             }
+            if isDown { keysDown.insert(event.keyCode) } else { keysDown.remove(event.keyCode) }
             send(.key(keyCode: event.keyCode, isDown: isDown, modifiers: InputMapping.wireModifiers(event.modifierFlags)))
         }
     }

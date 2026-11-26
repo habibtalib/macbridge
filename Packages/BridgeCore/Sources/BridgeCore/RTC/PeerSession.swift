@@ -44,18 +44,69 @@ public final class PeerSession: NSObject, @unchecked Sendable {
     }
 
     public let role: Role
-    public var onSignal: ((SignalPayload) -> Void)?
-    public var onState: ((PeerState) -> Void)?
+    public var onSignal: ((SignalPayload) -> Void)? {
+        get { callbacks.read { $0.onSignal } }
+        set { setCallback { $0.onSignal = newValue } }
+    }
+    public var onState: ((PeerState) -> Void)? {
+        get { callbacks.read { $0.onState } }
+        set { setCallback { $0.onState = newValue } }
+    }
     /// Host only: input received from the controller.
-    public var onInput: ((InputMessage) -> Void)?
+    public var onInput: ((InputMessage) -> Void)? {
+        get { callbacks.read { $0.onInput } }
+        set { setCallback { $0.onInput = newValue } }
+    }
     /// Controller only: the host's screen.
-    public var onRemoteVideoTrack: ((RTCVideoTrack) -> Void)?
+    public var onRemoteVideoTrack: ((RTCVideoTrack) -> Void)? {
+        get { callbacks.read { $0.onRemoteVideoTrack } }
+        set { setCallback { $0.onRemoteVideoTrack = newValue } }
+    }
     /// Controller only: both input channels are open and `send` will go through.
-    public var onInputReady: (() -> Void)?
+    public var onInputReady: (() -> Void)? {
+        get { callbacks.read { $0.onInputReady } }
+        set { setCallback { $0.onInputReady = newValue } }
+    }
     /// Controller: text was copied on the host.
-    public var onClipboard: ((String) -> Void)?
+    public var onClipboard: ((String) -> Void)? {
+        get { callbacks.read { $0.onClipboard } }
+        set { setCallback { $0.onClipboard = newValue } }
+    }
     /// Controller: the host's displays, sent when the session starts and when the shown display changes.
-    public var onDisplays: (([RemoteDisplay]) -> Void)?
+    public var onDisplays: (([RemoteDisplay]) -> Void)? {
+        get { callbacks.read { $0.onDisplays } }
+        set { setCallback { $0.onDisplays = newValue } }
+    }
+
+    /// The callbacks are set on the main thread and called on WebRTC's threads:
+    /// a lock, not `queue`, which `send` holds while it calls into WebRTC.
+    /// Cleared on close, which also breaks any cycle through a callback that
+    /// holds this session.
+    private struct Callbacks {
+        var isClosed = false
+        var onSignal: ((SignalPayload) -> Void)?
+        var onState: ((PeerState) -> Void)?
+        var onInput: ((InputMessage) -> Void)?
+        var onRemoteVideoTrack: ((RTCVideoTrack) -> Void)?
+        var onInputReady: (() -> Void)?
+        var onClipboard: ((String) -> Void)?
+        var onDisplays: (([RemoteDisplay]) -> Void)?
+    }
+
+    private final class Locked<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Value
+        init(_ value: Value) { self.value = value }
+        func read<T>(_ body: (Value) -> T) -> T { lock.withLock { body(value) } }
+        func write(_ body: (inout Value) -> Void) { lock.withLock { body(&value) } }
+    }
+
+    private let callbacks = Locked(Callbacks())
+
+    /// A callback set after close is dropped, so it cannot keep anything alive.
+    private func setCallback(_ body: (inout Callbacks) -> Void) {
+        callbacks.write { if !$0.isClosed { body(&$0) } }
+    }
 
     private static let reliableLabel = "input-reliable"
     private static let fastLabel = "input-fast"
@@ -128,8 +179,10 @@ public final class PeerSession: NSObject, @unchecked Sendable {
             self.reliableChannel = self.connection.dataChannel(forLabel: Self.reliableLabel, configuration: reliable)
             self.reliableChannel?.delegate = self
 
+            // Pointer moves: never resent, so a lost one is skipped, but kept in
+            // order, so an old position cannot land after a newer one.
             let fast = RTCDataChannelConfiguration()
-            fast.isOrdered = false
+            fast.isOrdered = true
             fast.maxRetransmits = 0
             self.fastChannel = self.connection.dataChannel(forLabel: Self.fastLabel, configuration: fast)
             self.fastChannel?.delegate = self
@@ -241,9 +294,10 @@ public final class PeerSession: NSObject, @unchecked Sendable {
                 "state", "nominated", "currentRoundTripTime", "availableOutgoingBitrate",
                 "localCandidateId", "remoteCandidateId", "packetsLost",
             ]
+            // Type and protocol only: addresses stay out of the log.
             var candidates: [String: String] = [:]
             for stat in report.statistics.values where stat.type == "local-candidate" || stat.type == "remote-candidate" {
-                candidates[stat.id] = [stat.values["candidateType"], stat.values["protocol"], stat.values["address"]].map { $0.map { "\($0)" } ?? "?" }.joined(separator: "/")
+                candidates[stat.id] = [stat.values["candidateType"], stat.values["protocol"]].map { $0.map { "\($0)" } ?? "?" }.joined(separator: "/")
             }
             for stat in report.statistics.values where wanted.contains(stat.type) {
                 if stat.type == "candidate-pair", (stat.values["nominated"] as? NSNumber)?.boolValue != true { continue }
@@ -260,25 +314,57 @@ public final class PeerSession: NSObject, @unchecked Sendable {
         case .request: "request"
         case .offer: "offer"
         case .answer: "answer"
-        case let .candidate(sdp, _, _): "candidate \(sdp)"
+        case let .candidate(sdp, _, _): "candidate \(candidateType(sdp))"
         case .bye: "bye"
         }
     }
 
-    /// Appends one line to ~/Library/Logs/MacBridge-stats.log.
-    public static func writeStats(_ line: String) {
+    /// A candidate's type ("host", "srflx", "relay"), the part of it worth logging:
+    /// the rest holds IP addresses.
+    static func candidateType(_ sdp: String) -> String {
+        let words = sdp.split(separator: " ")
+        guard let index = words.firstIndex(of: "typ"), index + 1 < words.count else { return "?" }
+        return String(words[index + 1])
+    }
+
+    private static let statsQueue = DispatchQueue(label: "macbridge.stats-log", qos: .utility)
+    /// Used only on `statsQueue`: the formatter is not thread-safe.
+    nonisolated(unsafe) private static let statsDateFormatter = ISO8601DateFormatter()
+    static let statsLogLimit = 5 * 1024 * 1024
+
+    static var statsLogURL: URL {
         #if os(macOS)
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MacBridge-stats.log")
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MacBridge-stats.log")
         #else
-        let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("MacBridge-stats.log")
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("MacBridge-stats.log")
         #endif
-        let text = "\(ISO8601DateFormatter().string(from: Date())) \(line)\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(Data(text.utf8))
-            try? handle.close()
-        } else {
-            try? Data(text.utf8).write(to: url)
+    }
+
+    /// Appends one line to ~/Library/Logs/MacBridge-stats.log, from any thread.
+    public static func writeStats(_ line: String) {
+        let date = Date()
+        statsQueue.async {
+            appendLine("\(statsDateFormatter.string(from: date)) \(line)\n", to: statsLogURL, limit: statsLogLimit)
+        }
+    }
+
+    /// Appends to the log. A log at `limit` bytes or more is first moved to
+    /// "<name>.1" (replacing the one there), so at most two are kept.
+    static func appendLine(_ text: String, to url: URL, limit: Int) {
+        let data = Data(text.utf8)
+        let files = FileManager.default
+        if let size = (try? files.attributesOfItem(atPath: url.path))?[.size] as? Int, size >= limit {
+            let old = url.appendingPathExtension("1")
+            try? files.removeItem(at: old)
+            try? files.moveItem(at: url, to: old)
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            try? data.write(to: url)
         }
     }
 
@@ -321,6 +407,10 @@ public final class PeerSession: NSObject, @unchecked Sendable {
     private func closeLocked() {
         guard !isClosed else { return }
         isClosed = true
+        let onState = callbacks.read { $0.onState }
+        // From here on nothing more is delivered: input arriving after close
+        // must not reach an injector that has already let go of every key.
+        callbacks.write { $0 = Callbacks(isClosed: true) }
         reliableChannel?.close()
         fastChannel?.close()
         remoteVideoTrack = nil
@@ -331,7 +421,7 @@ public final class PeerSession: NSObject, @unchecked Sendable {
 
 extension PeerSession: RTCPeerConnectionDelegate {
     public func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
-        Self.writeStats("local candidate: \(candidate.sdp)")
+        Self.writeStats("local candidate: \(Self.candidateType(candidate.sdp))")
         onSignal?(.candidate(sdp: candidate.sdp, mLineIndex: candidate.sdpMLineIndex, mid: candidate.sdpMid))
     }
 
@@ -394,7 +484,8 @@ extension PeerSession: RTCDataChannelDelegate {
     public func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
         // Only well-formed messages. The host acts on input; the controller
         // accepts nothing from the host but copied text.
-        guard let message = try? InputMessage(decoding: buffer.data) else { return }
+        guard let message = try? InputMessage(decoding: buffer.data),
+              !callbacks.read({ $0.isClosed }) else { return }
         switch role {
         case .host: onInput?(message)
         case .controller:

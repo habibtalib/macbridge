@@ -9,6 +9,10 @@ import Foundation
 public final class InputInjector: @unchecked Sendable {
     private let queue = DispatchQueue(label: "macbridge.input", qos: .userInteractive)
     private let source = CGEventSource(stateID: .hidSystemState)
+    /// Puts text on this Mac's clipboard. Called on the main queue.
+    private let writeClipboard: (String) -> Void
+    /// Posts one event. Tests replace it so nothing reaches the real system.
+    private let post: (CGEvent) -> Void
 
     // Guarded by `queue`.
     private var display: DisplayInfo
@@ -16,9 +20,20 @@ public final class InputInjector: @unchecked Sendable {
     private var keysDown: Set<UInt16> = []
     private var flags: CGEventFlags = []
     private var lastPoint: CGPoint
+    /// Set by `stop()`: input still queued or arriving later is dropped, so
+    /// nothing can be pressed again after everything was let go.
+    private var stopped = false
 
-    public init(display: DisplayInfo) {
+    /// - Parameter writeClipboard: puts text received from the controller on
+    ///   the clipboard; called on the main queue, before any later input is injected.
+    public convenience init(display: DisplayInfo, writeClipboard: @escaping (String) -> Void = InputInjector.setPasteboard) {
+        self.init(display: display, writeClipboard: writeClipboard, post: { $0.post(tap: .cghidEventTap) })
+    }
+
+    init(display: DisplayInfo, writeClipboard: @escaping (String) -> Void, post: @escaping (CGEvent) -> Void) {
         self.display = display
+        self.writeClipboard = writeClipboard
+        self.post = post
         lastPoint = CGPoint(x: display.origin.x + display.pointSize.width / 2,
                             y: display.origin.y + display.pointSize.height / 2)
     }
@@ -32,29 +47,54 @@ public final class InputInjector: @unchecked Sendable {
         return AXIsProcessTrustedWithOptions(options)
     }
 
+    public static func setPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     /// Points later events at another display (after the capture switched).
     public func setDisplay(_ display: DisplayInfo) {
         queue.async { self.display = display }
     }
 
     public func handle(_ message: InputMessage) {
-        queue.async { self.inject(message) }
+        queue.async {
+            guard !self.stopped else { return }
+            self.inject(message)
+        }
     }
 
-    /// Lets go of everything the controller was holding, so a dropped
-    /// connection cannot leave a key or button stuck down.
+    /// Lets go of everything the controller was holding (the display changed,
+    /// the connection is dropping), so no key or button stays stuck down.
     public func releaseAll() {
-        queue.async {
-            for key in self.keysDown {
-                self.postKey(key, isDown: false, flags: [])
-            }
-            self.keysDown.removeAll()
-            self.flags = []
-            for button in self.buttonsDown {
-                self.postMouse(Self.buttonEvent(button, isDown: false), at: self.lastPoint, button: button)
-            }
-            self.buttonsDown.removeAll()
+        queue.async { self.releaseAllLocked() }
+    }
+
+    /// Releases everything and drops all input from now on. The session is over.
+    /// `waitUntilDone`: returns only once the releases are posted (the app is quitting).
+    public func stop(waitUntilDone: Bool = false) {
+        let work = {
+            self.releaseAllLocked()
+            self.stopped = true
         }
+        if waitUntilDone { queue.sync(execute: work) } else { queue.async(execute: work) }
+    }
+
+    /// Waits for everything handed in so far to be done. For tests.
+    func drain() {
+        queue.sync {}
+    }
+
+    private func releaseAllLocked() {
+        for key in keysDown {
+            postKey(key, isDown: false, flags: [])
+        }
+        keysDown.removeAll()
+        flags = []
+        for button in buttonsDown {
+            postMouse(Self.buttonEvent(button, isDown: false), at: lastPoint, button: button)
+        }
+        buttonsDown.removeAll()
     }
 
     // MARK: - Injection
@@ -78,7 +118,7 @@ public final class InputInjector: @unchecked Sendable {
                 wheel1: Self.clampedInt32(dy), wheel2: Self.clampedInt32(dx), wheel3: 0
             ) else { return }
             event.flags = flags
-            event.post(tap: .cghidEventTap)
+            post(event)
 
         case let .key(keyCode, isDown, modifiers):
             flags = CGEventFlags(rawValue: UInt64(modifiers)).intersection(Self.modifierMask)
@@ -86,10 +126,16 @@ public final class InputInjector: @unchecked Sendable {
             postKey(keyCode, isDown: isDown, flags: flags)
 
         case let .clipboard(text):
+            // ⌘V follows right behind the text: it must be on the clipboard before
+            // the next event is injected. The wait is bounded so a main thread
+            // that waits on this queue (quitting) cannot lock up.
+            let written = DispatchSemaphore(value: 0)
+            let write = writeClipboard
             DispatchQueue.main.async {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
+                write(text)
+                written.signal()
             }
+            _ = written.wait(timeout: .now() + 1)
 
         case .nextDisplay, .quality, .selectDisplay, .displays:
             break // capture settings, handled by the session owner
@@ -111,7 +157,7 @@ public final class InputInjector: @unchecked Sendable {
         ) else { return }
         event.setIntegerValueField(.mouseEventClickState, value: clickCount)
         event.flags = flags
-        event.post(tap: .cghidEventTap)
+        post(event)
     }
 
     private func postKey(_ keyCode: UInt16, isDown: Bool, flags: CGEventFlags) {
@@ -120,7 +166,7 @@ public final class InputInjector: @unchecked Sendable {
         // Real arrow keys carry these two marks; macOS expects them on Control-arrow (switch desktop).
         if (123...126).contains(keyCode) { flags.formUnion([.maskNumericPad, .maskSecondaryFn]) }
         event.flags = flags
-        event.post(tap: .cghidEventTap)
+        post(event)
     }
 
     // MARK: - Mapping

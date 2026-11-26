@@ -94,7 +94,13 @@ public enum Headless {
     }
 
     public static func needsVirtualDisplay() -> Bool {
-        needsVirtualDisplay(active: activeDisplays(), lidClosed: isLidClosed)
+        needsVirtualDisplay(ignoring: nil)
+    }
+
+    /// `ignoring`: a virtual display MacBridge made itself, which is no screen
+    /// anyone can see.
+    public static func needsVirtualDisplay(ignoring id: CGDirectDisplayID?) -> Bool {
+        needsVirtualDisplay(active: activeDisplays().filter { $0.id != id }, lidClosed: isLidClosed)
     }
 
     /// `AppleClamshellState` of the power-management root domain; false on
@@ -123,6 +129,50 @@ public enum Headless {
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
         guard get(count, &ids, &count) == .success else { return [] }
         return Array(ids.prefix(Int(count)))
+    }
+}
+
+/// Reports displays being added, removed, moved or changing resolution, once
+/// things settle, on the main queue. Stops when released.
+public final class DisplayChangeWatcher {
+    /// Handed to CoreGraphics. It outlives the watcher until the callback is
+    /// removed, so a late callback finds no watcher instead of freed memory.
+    private final class Token {
+        weak var watcher: DisplayChangeWatcher?
+    }
+
+    private let onChange: () -> Void
+    private let token = Token()
+    private var pending: DispatchWorkItem?
+    static let settleDelay: TimeInterval = 0.5
+
+    public init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        token.watcher = self
+        CGDisplayRegisterReconfigurationCallback(Self.callback, Unmanaged.passRetained(token).toOpaque())
+    }
+
+    deinit {
+        pending?.cancel()
+        let pointer = Unmanaged.passUnretained(token).toOpaque()
+        CGDisplayRemoveReconfigurationCallback(Self.callback, pointer)
+        Unmanaged<Token>.fromOpaque(pointer).release()
+    }
+
+    private static let callback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+        // Each change is reported twice: before (begin flag) and after. Only "after" counts.
+        guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
+        let token = Unmanaged<Token>.fromOpaque(userInfo).takeUnretainedValue()
+        DispatchQueue.main.async { token.watcher?.changed() }
+    }
+
+    /// On main. One change brings several callbacks (one per display): they
+    /// are reported as one.
+    private func changed() {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.onChange() }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleDelay, execute: work)
     }
 }
 #endif

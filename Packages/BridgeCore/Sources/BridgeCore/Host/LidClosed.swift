@@ -37,6 +37,7 @@ public enum LidAndPower {
     }
 
     /// `pmset`'s SleepDisabled: the Mac stays awake with the lid closed.
+    /// Runs `pmset` and waits for it: keep it off the main thread.
     public static func isLidSleepDisabled() -> Bool {
         let process = Process(), pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
@@ -46,7 +47,16 @@ public enum LidAndPower {
         guard (try? process.run()) != nil else { return false }
         let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         process.waitUntilExit()
-        return text.split(separator: "\n").contains { $0.contains("SleepDisabled") && $0.split(separator: " ").last == "1" }
+        return sleepDisabled(pmsetOutput: text)
+    }
+
+    /// Reads SleepDisabled from `pmset -g` output. pmset lines up its columns
+    /// with tabs as well as spaces, so any whitespace separates.
+    static func sleepDisabled(pmsetOutput text: String) -> Bool {
+        text.split(separator: "\n").contains { line in
+            let words = line.split(whereSeparator: \.isWhitespace)
+            return words.first == "SleepDisabled" && words.last == "1"
+        }
     }
 
     public static var isOnPowerAdapter: Bool {
@@ -70,15 +80,20 @@ public final class LidClosedKeeper {
 
     private let run: ([String]) -> Void
     private let now: () -> Date
-    private let sleepAlreadyDisabled: () -> Bool
+    /// nil: read `pmset` on a background thread before a hold begins.
+    private let sleepAlreadyDisabled: (() -> Bool)?
     private var heldAt: Date?
     /// Lid-close sleep was already off when the hold began (you turned LidAwake on yourself):
     /// it is then left as it was when the hold ends.
     private var wasOnBefore = false
+    /// The last answer to `update`, for a hold that waits on `pmset`.
+    private var wantsHold = false
+    private var isCheckingPmset = false
 
     /// `run`: starts `lidawake` with these arguments. nil when LidAwake is not installed.
+    /// `sleepAlreadyDisabled`: answers at once; nil reads `pmset` off the main thread.
     public init(run: (([String]) -> Void)? = LidClosedKeeper.lidAwakeRunner(), now: @escaping () -> Date = Date.init,
-                sleepAlreadyDisabled: @escaping () -> Bool = LidAndPower.isLidSleepDisabled) {
+                sleepAlreadyDisabled: (() -> Bool)? = nil) {
         self.run = run ?? { _ in }
         self.now = now
         self.sleepAlreadyDisabled = sleepAlreadyDisabled
@@ -92,11 +107,25 @@ public final class LidClosedKeeper {
     /// Call whenever the answer may have changed, and at least every few minutes.
     public func update(shouldHold: Bool) {
         guard isAvailable else { return }
+        wantsHold = shouldHold
         if shouldHold {
-            if let heldAt, now().timeIntervalSince(heldAt) < Self.renewAfter { return }
-            if heldAt == nil { wasOnBefore = sleepAlreadyDisabled() }
-            heldAt = now()
-            run(["keepalive", "\(Self.holdMinutes)m", "--reason", Self.reason])
+            if let heldAt {
+                guard now().timeIntervalSince(heldAt) >= Self.renewAfter else { return }
+                self.heldAt = now()
+                run(["keepalive", "\(Self.holdMinutes)m", "--reason", Self.reason])
+            } else if let sleepAlreadyDisabled {
+                begin(wasOn: sleepAlreadyDisabled())
+            } else if !isCheckingPmset {
+                // pmset has to be read before the hold switches lid sleep off, and it can take a
+                // moment: the hold begins once it has answered.
+                isCheckingPmset = true
+                Task { @MainActor [weak self] in
+                    let wasOn = await Task.detached { LidAndPower.isLidSleepDisabled() }.value
+                    guard let self else { return }
+                    self.isCheckingPmset = false
+                    if self.wantsHold, self.heldAt == nil { self.begin(wasOn: wasOn) }
+                }
+            }
         } else if heldAt != nil {
             heldAt = nil
             run(["release", "--reason", Self.reason])
@@ -104,6 +133,12 @@ public final class LidClosedKeeper {
             // long after. MacBridge turned it on, so MacBridge turns it off.
             if !wasOnBefore { run(["off"]) }
         }
+    }
+
+    private func begin(wasOn: Bool) {
+        wasOnBefore = wasOn
+        heldAt = now()
+        run(["keepalive", "\(Self.holdMinutes)m", "--reason", Self.reason])
     }
 
     nonisolated public static func lidAwakePath() -> String? {

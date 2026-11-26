@@ -59,9 +59,10 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
     private let identity: Identity
     private let accessToken: String?
     private let queue = DispatchQueue(label: "macbridge.signaling")
-    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
 
     // Guarded by `queue`.
+    /// Holds this client as its delegate until invalidated in `stop()`.
+    private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var wantsConnection = false
     private var attempt = 0
@@ -145,6 +146,8 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
 
     private func open() {
         set(.connecting)
+        let session = self.session ?? URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+        self.session = session
         let task = session.webSocketTask(with: url)
         task.maximumMessageSize = 256 * 1024
         self.task = task
@@ -157,6 +160,10 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         wantsConnection = false
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        // A URLSession keeps its delegate until invalidated: without this the
+        // client, and the model it calls back, would never be freed.
+        session?.invalidateAndCancel()
+        session = nil
         flushIceWaiters()
         set(.offline)
     }

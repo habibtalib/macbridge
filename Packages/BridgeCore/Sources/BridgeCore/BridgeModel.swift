@@ -291,11 +291,28 @@ public final class BridgeModel: ObservableObject {
         goOffline()
         guard let url = parsedServerURL else { return }
         let client = SignalingClient(url: url, identity: identity, accessToken: accessToken)
-        client.onStatus = { [weak self] status in self?.signalingStatus = status }
-        client.onSignal = { [weak self] from, envelope in self?.receive(envelope, from: from) }
-        client.onError = { [weak self] error in self?.receive(error) }
-        client.onPairRequest = { [weak self] from, sealed in self?.receivePairRequest(sealed, from: from) }
-        client.onPairReply = { [weak self] from, sealed in self?.receivePairReply(sealed, from: from) }
+        // Callbacks queued by a client that has since been replaced (going offline, another
+        // server) are dropped: a late "offline" must not overwrite the new client's status.
+        client.onStatus = { [weak self, weak client] status in
+            guard let self, self.signaling === client else { return }
+            self.signalingStatus = status
+        }
+        client.onSignal = { [weak self, weak client] from, envelope in
+            guard let self, self.signaling === client else { return }
+            self.receive(envelope, from: from)
+        }
+        client.onError = { [weak self, weak client] error in
+            guard let self, self.signaling === client else { return }
+            self.receive(error)
+        }
+        client.onPairRequest = { [weak self, weak client] from, sealed in
+            guard let self, self.signaling === client else { return }
+            self.receivePairRequest(sealed, from: from)
+        }
+        client.onPairReply = { [weak self, weak client] from, sealed in
+            guard let self, self.signaling === client else { return }
+            self.receivePairReply(sealed, from: from)
+        }
         signaling = client
         client.connect()
         updatePower()
@@ -608,19 +625,23 @@ public final class BridgeModel: ObservableObject {
         }
         controllerSession = session
 
-        session.onSignal = { [weak self] payload in
+        // The callbacks are stored on the session: they hold it weakly, or it could never be freed.
+        session.onSignal = { [weak self, weak session] payload in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 self.send(payload, to: host)
             }
         }
-        session.onRemoteVideoTrack = { [weak self] track in
+        session.onRemoteVideoTrack = { [weak self, weak session] track in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 self.remoteVideo = RemoteVideo(track: track)
             }
         }
-        session.onState = { [weak self] state in
+        session.onState = { [weak self, weak session] state in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 switch state {
@@ -639,13 +660,15 @@ public final class BridgeModel: ObservableObject {
                 }
             }
         }
-        session.onClipboard = { [weak self] text in
+        session.onClipboard = { [weak self, weak session] text in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 self.controllerClipboard?.receive(text)
             }
         }
-        session.onDisplays = { [weak self] displays in
+        session.onDisplays = { [weak self, weak session] displays in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.controllerSession === session else { return }
                 self.remoteDisplays = displays
@@ -779,22 +802,29 @@ public final class BridgeModel: ObservableObject {
         }
         // One controller at a time: a new request replaces the current session.
         // A retry from the same device must not get a bye: it would end the
-        // attempt that the device has just started.
-        endHosting(notify: hostPeer?.id != peer.id)
+        // attempt that the device has just started. A virtual display stays for
+        // the new session: capturing it while it is being removed would fail.
+        endHosting(notify: hostPeer?.id != peer.id, keepVirtualDisplay: true)
         hostPeer = peer
         let servers = await iceServers()
-        guard hostPeer == peer, hostSession == nil,
-              let session = PeerSession(role: .host, iceServers: servers, relayOnly: forcesRelay) else { return }
+        guard hostPeer == peer, hostSession == nil else { return }
+        guard let session = PeerSession(role: .host, iceServers: servers, relayOnly: forcesRelay) else {
+            notice = "Could not start a session for \(peer.name)."
+            return endHosting(notify: true)
+        }
         hostSession = session
         updateLidHold()
 
-        session.onSignal = { [weak self] payload in
+        // The callbacks are stored on the session: they hold it weakly, or it could never be freed.
+        session.onSignal = { [weak self, weak session] payload in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.hostSession === session else { return }
                 self.send(payload, to: peer)
             }
         }
-        session.onState = { [weak self] state in
+        session.onState = { [weak self, weak session] state in
+            guard let session else { return }
             Task { @MainActor in
                 guard let self, self.hostSession === session else { return }
                 switch state {
@@ -807,6 +837,8 @@ public final class BridgeModel: ObservableObject {
                     self.logSessionStart(peer)
                 case .failed, .closed: self.endHosting(notify: false)
                 case .disconnected:
+                    // The key-ups may never come: let go now rather than in 10 seconds.
+                    self.injector?.releaseAll()
                     guard self.hostDisconnectTimer == nil else { break }
                     self.hostDisconnectTimer = Task { @MainActor [weak self] in
                         try? await Task.sleep(nanoseconds: 10_000_000_000)
@@ -822,32 +854,40 @@ public final class BridgeModel: ObservableObject {
             // A sleeping display gives the capturer nothing to send.
             power.keepDisplayAwake = true
             hostQuality = .sharp
-            let display = try await startCapture(on: await displayForSession())
-            guard hostSession === session else { return } // replaced while starting
-            let injector = InputInjector(display: display)
+            let display = try await startCapture(on: await displayForSession(), quality: hostQuality, for: session)
+            guard hostSession === session else {
+                // Ended while starting: make sure nothing keeps capturing. A session that
+                // replaced this one starts its own capture after this stop.
+                if hostSession == nil { stopCapture() }
+                return
+            }
+            hostDisplay = display
+            shownQuality = hostQuality
+            // The clipboard is written from the injector's queue, so text sent ahead of ⌘V is
+            // on the clipboard before the ⌘V is injected. Through the sync, so the copy is not
+            // sent straight back.
+            let injector = InputInjector(display: display, writeClipboard: { [weak self] text in
+                MainActor.assumeIsolated { self?.hostClipboard?.receive(text) }
+            })
             self.injector = injector
             let clipboard = ClipboardSync()
             clipboard.onLocalCopy = { [weak session] text in session?.send(.clipboard(text: text)) }
             clipboard.start()
             hostClipboard = clipboard
-            session.onInput = { [weak self] message in
+            session.onInput = { [weak self, weak session] message in
                 switch message {
-                case let .clipboard(text):
-                    // Through the sync, so the copy is not sent straight back.
-                    Task { @MainActor in
-                        guard let self, self.hostSession === session else { return }
-                        self.hostClipboard?.receive(text)
-                    }
                 case .nextDisplay, .quality, .selectDisplay:
+                    guard let session else { return }
                     Task { @MainActor in
                         guard let self, self.hostSession === session else { return }
-                        await self.reconfigureCapture(message)
+                        self.reconfigureCapture(.request(message))
                     }
                 default:
                     injector.handle(message)
                 }
             }
-            session.onInputReady = { [weak self] in
+            session.onInputReady = { [weak self, weak session] in
+                guard let session else { return }
                 Task { @MainActor in
                     guard let self, self.hostSession === session else { return }
                     await self.sendDisplays()
@@ -855,6 +895,10 @@ public final class BridgeModel: ObservableObject {
             }
             capturer.onFrame = { [weak session] buffer, timestampNs in
                 session?.push(buffer, timestampNs: timestampNs)
+            }
+            // Displays plugged in, unplugged or set to another resolution mid-session.
+            displayWatcher = DisplayChangeWatcher { [weak self] in
+                MainActor.assumeIsolated { self?.reconfigureCapture(.displaysChanged) }
             }
             session.start()
             PeerSession.writeStats("session started for \(peer.name)")
@@ -868,6 +912,8 @@ public final class BridgeModel: ObservableObject {
                 notice = "\(peer.name) can see this screen but not control it: Accessibility is not allowed for MacBridge."
             }
         } catch {
+            // Ended or replaced while starting: not a capture failure.
+            guard hostSession === session else { return }
             notice = "Could not capture the screen: \(error.localizedDescription)"
             send(.bye, to: peer)
             endHosting(notify: false)
@@ -878,7 +924,14 @@ public final class BridgeModel: ObservableObject {
     /// this Mac has a working screen, otherwise a virtual display created for
     /// the session. A closed lid with no monitor would otherwise send black.
     private func displayForSession() async -> CGDirectDisplayID? {
-        guard Headless.needsVirtualDisplay() else { return nil }
+        // A virtual display kept from the session this one replaced is no screen anyone sees.
+        guard Headless.needsVirtualDisplay(ignoring: virtualDisplay?.displayID) else {
+            if let kept = virtualDisplay {
+                virtualDisplay = nil
+                stopCapture(releasing: kept)
+            }
+            return nil
+        }
         if virtualDisplay == nil {
             do {
                 virtualDisplay = try VirtualDisplay()
@@ -898,37 +951,134 @@ public final class BridgeModel: ObservableObject {
         return virtual.displayID
     }
 
-    private func startCapture(on displayID: CGDirectDisplayID?) async throws -> DisplayInfo {
-        let display = try await capturer.start(
-            displayID: displayID,
-            maxPixelWidth: hostQuality.maxPixelWidth,
-            maxPixelHeight: hostQuality.maxPixelHeight,
-            framesPerSecond: hostQuality.framesPerSecond
-        )
-        hostDisplay = display
-        return display
+    // MARK: Capture start and stop
+
+    /// Every capture start and stop, in the order asked for. Each waits for the
+    /// one before, so a stop can never be overtaken by an older start, and two
+    /// starts never run at once.
+    private var captureChain: Task<Void, Never>?
+
+    private func enqueueCapture<T>(_ work: @escaping @MainActor () async throws -> T) -> Task<T, Error> {
+        let previous = captureChain
+        let task = Task { @MainActor in
+            await previous?.value
+            return try await work()
+        }
+        captureChain = Task { _ = await task.result }
+        return task
     }
 
-    /// The controller asked for another display or another quality.
-    private func reconfigureCapture(_ message: InputMessage) async {
-        var target = hostDisplay?.id
-        switch message {
-        case let .quality(preset):
-            guard preset != hostQuality else { return }
-            hostQuality = preset
-        case .nextDisplay:
-            guard let displays = try? await ScreenCapturer.displays(), displays.count > 1 else { return }
-            let index = displays.firstIndex { $0.id == hostDisplay?.id } ?? -1
-            target = displays[(index + 1) % displays.count].id
-        case let .selectDisplay(id):
-            guard id != hostDisplay?.id, let displays = try? await ScreenCapturer.displays(),
-                  displays.contains(where: { $0.id == id }) else { return }
-            target = id
-        default:
-            return
+    /// Starts capture for `session`, unless that session has ended by its turn.
+    private func startCapture(on displayID: CGDirectDisplayID?, quality: QualityPreset,
+                              for session: PeerSession) async throws -> DisplayInfo {
+        try await enqueueCapture { [weak self, capturer] in
+            guard let self, self.hostSession === session else { throw CancellationError() }
+            return try await capturer.start(
+                displayID: displayID,
+                maxPixelWidth: quality.maxPixelWidth,
+                maxPixelHeight: quality.maxPixelHeight,
+                framesPerSecond: quality.framesPerSecond
+            )
+        }.value
+    }
+
+    /// The virtual display goes only after capture has stopped, so the
+    /// stream does not end with an error first.
+    private func stopCapture(releasing virtual: VirtualDisplay? = nil) {
+        _ = enqueueCapture { [capturer] in
+            await capturer.stop()
+            withExtendedLifetime(virtual) {}
         }
-        let session = hostSession
-        guard let display = try? await startCapture(on: target), hostSession === session else { return }
+    }
+
+    // MARK: Changing what is captured
+
+    private enum CaptureChange {
+        /// From the controller: `.quality`, `.nextDisplay` or `.selectDisplay`.
+        case request(InputMessage)
+        case displaysChanged
+    }
+
+    /// Capture changes run one at a time, in order.
+    private var reconfigureTask: Task<Void, Never>?
+    private var reconfigureCount = 0
+    /// What the changes so far ask for. Only the newest change restarts
+    /// capture, with all of them applied.
+    private var wantedDisplay: CGDirectDisplayID?
+    private var wantsRestart = false
+    /// The quality of the capture that is running, to fall back to.
+    private var shownQuality = QualityPreset.sharp
+    private var displayWatcher: DisplayChangeWatcher?
+
+    /// The controller asked for another display or another quality, or this Mac's displays changed.
+    private func reconfigureCapture(_ change: CaptureChange) {
+        guard let session = hostSession else { return }
+        reconfigureCount += 1
+        let number = reconfigureCount, previous = reconfigureTask
+        reconfigureTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.hostSession === session else { return }
+            await self.apply(change, number: number, session: session)
+        }
+    }
+
+    private func apply(_ change: CaptureChange, number: Int, session: PeerSession) async {
+        var target = wantsRestart ? wantedDisplay : hostDisplay?.id
+        var changed = false
+        switch change {
+        case let .request(.quality(preset)):
+            changed = preset != hostQuality
+            hostQuality = preset
+        case .request(.nextDisplay):
+            if let displays = try? await ScreenCapturer.displays(), displays.count > 1 {
+                let index = displays.firstIndex { $0.id == target } ?? -1
+                target = displays[(index + 1) % displays.count].id
+                changed = true
+            }
+        case let .request(.selectDisplay(id)):
+            if id != target, let displays = try? await ScreenCapturer.displays(), displays.contains(where: { $0.id == id }) {
+                target = id
+                changed = true
+            }
+        case .displaysChanged:
+            guard let displays = try? await ScreenCapturer.displays() else { break }
+            if let shown = displays.first(where: { $0.id == target }) {
+                // Moved or resized: the pointer mapping and the stream size follow.
+                changed = shown != hostDisplay
+            } else {
+                // The display shown is gone: the main display, or the virtual one if this Mac has no other.
+                target = virtualDisplay?.displayID
+                changed = true
+            }
+        case .request:
+            break
+        }
+        guard hostSession === session else { return }
+        wantedDisplay = target
+        wantsRestart = wantsRestart || changed
+        // A newer change is waiting: it restarts capture once, with this one included.
+        guard number == reconfigureCount, wantsRestart else { return }
+        wantsRestart = false
+
+        let fallback = (display: hostDisplay?.id, quality: shownQuality)
+        if let display = try? await startCapture(on: target, quality: hostQuality, for: session) {
+            return await show(display, quality: hostQuality, session: session)
+        }
+        guard hostSession === session else { return }
+        // Back to what was shown before; with nothing to show, the session ends.
+        hostQuality = fallback.quality
+        if let display = try? await startCapture(on: fallback.display, quality: fallback.quality, for: session) {
+            return await show(display, quality: fallback.quality, session: session)
+        }
+        guard hostSession === session else { return }
+        notice = "The screen could not be captured any more."
+        endHosting(notify: true)
+    }
+
+    private func show(_ display: DisplayInfo, quality: QualityPreset, session: PeerSession) async {
+        guard hostSession === session else { return }
+        hostDisplay = display
+        shownQuality = quality
         // Nothing may stay held on the display being left.
         injector?.releaseAll()
         injector?.setDisplay(display)
@@ -957,7 +1107,17 @@ public final class BridgeModel: ObservableObject {
         endHosting(notify: true)
     }
 
-    private func endHosting(notify: Bool) {
+    /// The app is quitting: end the session, waiting until every key and
+    /// button the controller held is released, and let the Mac sleep again.
+    public func prepareForQuit() {
+        endHosting(notify: true, waitForInputRelease: true)
+        releaseLidHold()
+    }
+
+    /// - Parameters:
+    ///   - keepVirtualDisplay: a new session takes over the virtual display.
+    ///   - waitForInputRelease: return only once held keys and buttons are let go.
+    private func endHosting(notify: Bool, keepVirtualDisplay: Bool = false, waitForInputRelease: Bool = false) {
         guard let peer = hostPeer else { return }
         if notify { send(.bye, to: peer) }
         hostDisconnectTimer?.cancel()
@@ -972,19 +1132,21 @@ public final class BridgeModel: ObservableObject {
         hostDisplay = nil
         logSessionEnd()
         capturer.onFrame = nil
+        displayWatcher = nil
+        reconfigureTask?.cancel()
+        reconfigureTask = nil
+        wantsRestart = false
         hostClipboard?.stop()
         hostClipboard = nil
-        injector?.releaseAll()
+        // First no more input, then let go of everything: input still arriving
+        // could otherwise press a key again after its release.
+        session?.onInput = nil
+        injector?.stop(waitUntilDone: waitForInputRelease)
         injector = nil
         session?.close()
-        // The virtual display goes only after capture has stopped, so the
-        // stream does not end with an error first.
-        let virtual = virtualDisplay
-        virtualDisplay = nil
-        Task {
-            await capturer.stop()
-            withExtendedLifetime(virtual) {}
-        }
+        let virtual = keepVirtualDisplay ? nil : virtualDisplay
+        if !keepVirtualDisplay { virtualDisplay = nil }
+        stopCapture(releasing: virtual)
     }
 
     // MARK: - Session log
