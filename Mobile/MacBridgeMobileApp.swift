@@ -70,7 +70,8 @@ struct RootScreen: View {
                     interrupted = host
                     model.disconnect()
                 case .idle, .failed:
-                    break
+                    // A call still waiting for the server would start in the background.
+                    if model.hostAwaitingServer != nil { model.disconnect() }
                 }
             case .active:
                 // A socket left in the background is often dead: check it, or reconnect without backoff.

@@ -108,7 +108,7 @@ public final class BridgeModel: ObservableObject {
     }
     /// A Mac to connect to once the server answers: asked for while the connection was still
     /// coming back (an iPhone back from the background, a Mac back from sleep).
-    private(set) var hostAwaitingServer: PairedDevice?
+    @Published public private(set) var hostAwaitingServer: PairedDevice?
     private var hostAwaitingTimeout: Task<Void, Never>?
     /// A scanned pairing code kept until the server it came with answers.
     private var codeAwaitingServer: String?
@@ -208,7 +208,14 @@ public final class BridgeModel: ObservableObject {
                 // The session ends only if nothing can be captured. Before the first
                 // capture is shown there is nothing to fall back to.
                 if self.hostSession != nil, self.hostDisplay != nil {
-                    self.reconfigureCapture(.captureStopped)
+                    // A display whose stream keeps stopping while a restart keeps succeeding
+                    // would restart for ever: past the budget, the session ends.
+                    if self.captureStops.recordStop() {
+                        self.notice = "The session ended: capturing the screen kept stopping."
+                        self.endHosting(notify: true)
+                    } else {
+                        self.reconfigureCapture(.captureStopped)
+                    }
                 } else {
                     self.endHosting(notify: true)
                 }
@@ -662,6 +669,7 @@ public final class BridgeModel: ObservableObject {
 
     /// Forgets a Mac this one could control.
     public func forget(_ device: PairedDevice) {
+        if device.id == hostAwaitingServer?.id { cancelWaitingConnect() }
         if device.id == controllerPeer?.id { disconnect() }
         update(device.id) { $0.thisMacMayControl = false }
     }
@@ -728,7 +736,11 @@ public final class BridgeModel: ObservableObject {
     /// Calls a paired Mac. While the server connection is still coming back, the call waits
     /// until it is online.
     public func connect(to host: PairedDevice) {
-        guard let host = controllable.first(where: { $0.id == host.id }) else { return }
+        guard let host = controllable.first(where: { $0.id == host.id }) else {
+            // Forgotten while waiting for the server: nothing to wait for any more.
+            if hostAwaitingServer?.id == host.id { cancelWaitingConnect() }
+            return
+        }
         guard signalingStatus == .online else { return connectOnceOnline(host) }
         cancelWaitingConnect()
         disconnect()
@@ -744,6 +756,8 @@ public final class BridgeModel: ObservableObject {
     }
 
     private func connectOnceOnline(_ host: PairedDevice) {
+        // Asked again for the Mac already waited for: the wait goes on as it was.
+        if hostAwaitingServer?.id == host.id { return }
         if signaling == nil {
             guard canGoOnline else { return }
             goOnline()
@@ -799,6 +813,7 @@ public final class BridgeModel: ObservableObject {
         }
         controllerSession = session
         qualitySent = false
+        sessionQuality = nil
 
         // The callbacks are stored on the session: they hold it weakly, or it could never be freed.
         session.onSignal = { [weak self, weak session] payload in
@@ -856,14 +871,19 @@ public final class BridgeModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.controllerSession === session, !self.qualitySent else { return }
                 self.qualitySent = true
-                if self.preferredQuality != .sharp { session.send(.quality(self.preferredQuality)) }
+                // The host starts at Sharp, so Sharp needs no message.
+                let preset = self.sessionQuality ?? self.preferredQuality
+                if preset != .sharp { session.send(.quality(preset)) }
             }
         }
         send(.request, to: host)
     }
 
-    /// Whether the controller session has asked for `preferredQuality` yet.
+    /// Whether the controller session has asked for its quality yet.
     private var qualitySent = false
+    /// A quality chosen for this session only, kept apart from `preferredQuality`. Asked for
+    /// when the channels open if chosen before that. Cleared when a session starts.
+    @Published public var sessionQuality: QualityPreset?
 
     /// Connects again to the Mac of the session that just ended or failed.
     public func reconnect() {
@@ -1045,6 +1065,7 @@ public final class BridgeModel: ObservableObject {
             // A sleeping display gives the capturer nothing to send.
             power.keepDisplayAwake = true
             hostQuality = .sharp
+            captureStops = StopBudget()
             let display = try await startCapture(on: await displayForSession(), quality: hostQuality, for: session)
             guard hostSession === session else {
                 // Ended while starting: make sure nothing keeps capturing. A session that
@@ -1087,7 +1108,9 @@ public final class BridgeModel: ObservableObject {
             capturer.setOnFrame { [weak session] buffer, timestampNs in
                 session?.push(buffer, timestampNs: timestampNs)
             }
-            // Displays plugged in, unplugged or set to another resolution mid-session.
+            // Displays plugged in, unplugged or set to another resolution mid-session. Removals
+            // expected from before this watcher would never be reported to it.
+            releasedDisplays.removeAll()
             displayWatcher = DisplayChangeWatcher { [weak self] changed in
                 MainActor.assumeIsolated { self?.displaysChanged(changed) }
             }
@@ -1174,6 +1197,9 @@ public final class BridgeModel: ObservableObject {
             )
         }.value
     }
+
+    /// Stopped capture streams in this hosting session.
+    private var captureStops = StopBudget()
 
     /// Virtual displays let go of whose removal is still to be reported. Their
     /// removal is expected, not a change for the session to react to.
@@ -1385,6 +1411,8 @@ public final class BridgeModel: ObservableObject {
         } else {
             stopCapture()
         }
+        // No watcher is left to report the removals still expected.
+        releasedDisplays.removeAll()
     }
 
     // MARK: - Session log
@@ -1540,5 +1568,19 @@ private final class TokenBox: @unchecked Sendable {
     var value: [String: String] {
         get { lock.withLock { _value } }
         set { lock.withLock { _value = newValue } }
+    }
+}
+
+/// Counts stopped capture streams. A few close together mean the display keeps failing; a
+/// quiet spell longer than the window starts the count again.
+struct StopBudget {
+    var limit = 3
+    var window: TimeInterval = 10
+    private(set) var stops: [Date] = []
+
+    /// Records a stop. True once `limit` stops fall within `window`.
+    mutating func recordStop(at now: Date = Date()) -> Bool {
+        stops = stops.filter { now.timeIntervalSince($0) < window } + [now]
+        return stops.count >= limit
     }
 }

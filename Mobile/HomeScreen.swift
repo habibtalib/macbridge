@@ -88,6 +88,17 @@ struct HomeScreen: View {
                         .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     status
+                    if let waiting = model.hostAwaitingServer {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("Connecting to \(model.displayName(waiting))… (waiting for server)")
+                                .font(.callout).fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 4)
+                            Button("Cancel") { model.disconnect() }.buttonStyle(.bordered)
+                        }
+                        .padding(12)
+                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
                     connectField
                     if showsFilters {
                         filterPills

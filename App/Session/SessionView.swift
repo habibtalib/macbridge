@@ -210,7 +210,8 @@ struct SessionView: View {
                 Button("Next Desktop", systemImage: "chevron.right") { model.sendShortcut(.nextDesktop) }
                 Button("Mission Control", systemImage: "rectangle.3.group") { model.sendShortcut(.missionControl) }
             }
-            Section("Keys this Mac keeps for itself") {
+            // Pressed on the other Mac, for when this Mac does not pass them on (no Accessibility).
+            Section("Send to the other Mac") {
                 Button("Spotlight (⌘Space)", systemImage: "magnifyingglass") { model.sendShortcut(.spotlight) }
                 Button("Switch App (⌘Tab)", systemImage: "square.on.square") { model.sendShortcut(.appSwitcher) }
             }

@@ -100,8 +100,8 @@ Pairing is one-way: the Mac that showed the code can be controlled by the Mac th
   - *Actions*: previous and next desktop, Mission Control, Spotlight, switch app, send clipboard, save screenshot (to the Desktop, and copied), lock screen.
   - *Full Screen*: move the pointer to the top edge to get the toolbar back.
   - *Disconnect*.
-- Control-← and Control-→ (switch desktop) and Control-↑ go to the other Mac while the session window is in front, if this Mac allows MacBridge under Accessibility. Without that, use the Actions menu.
-- ⌘Space, ⌘Tab and trackpad swipes between desktops stay on this Mac. Actions has *Spotlight* and *Switch App* to press them on the other Mac.
+- Control-← / Control-→, Control-↑ and ⌘Space go to the other Mac while the session window is in front, if this Mac allows MacBridge under Accessibility. Without that, use the Actions menu.
+- Trackpad swipes between desktops and ⌘Tab stay on this Mac.
 - Closing the window during a session asks first, then disconnects.
 - If the session drops, the window offers **Reconnect**.
 

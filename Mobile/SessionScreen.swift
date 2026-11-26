@@ -7,18 +7,18 @@ struct SessionScreen: View {
     let video: RemoteVideo
     let host: PairedDevice
     @StateObject private var input: SessionInput
-    /// Set from this session's menu. It applies to this session only: Settings keeps the default.
-    @State private var sessionQuality: QualityPreset?
     @State private var barCollapsed = false
     @State private var showsStats = false
     @State private var note: String?
 
+    /// Set from this session's menu, for this session only: Settings keeps the default. Kept by
+    /// the model, which asks for it when the channels open if they are not open yet.
     private var quality: Binding<QualityPreset> {
         Binding(
-            get: { sessionQuality ?? model.preferredQuality },
+            get: { model.sessionQuality ?? model.preferredQuality },
             set: { preset in
-                guard preset != (sessionQuality ?? model.preferredQuality) else { return }
-                sessionQuality = preset
+                guard preset != (model.sessionQuality ?? model.preferredQuality) else { return }
+                model.sessionQuality = preset
                 model.sendInput(.quality(preset))
                 show(preset == .sharp ? "Quality: Sharp" : preset == .balanced ? "Quality: Balanced" : "Quality: Light")
             }

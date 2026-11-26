@@ -333,6 +333,65 @@ struct BridgeModelTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aSessionQualityChosenBeforeTheChannelsOpenIsAskedFor() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (laptop, studioID, standIn, received) = try await laptopCallingAStandIn(server)
+        defer { laptop.goOffline(); standIn.disconnect() }
+        laptop.preferredQuality = .light
+        laptop.sessionQuality = .sharp // from an earlier session: cleared when this one starts
+        let studio = try #require(laptop.controllable.first)
+
+        let host = try #require(PeerSession(role: .host))
+        defer { host.close() }
+        let laptopID = laptop.deviceID
+        host.onSignal = { payload in
+            standIn.send(SignalEnvelope(payload, auth: SessionAuth.sign(payload, to: laptopID, identity: studioID)), to: laptopID)
+        }
+        host.onInput = { message in DispatchQueue.main.async { received.input.append(message) } }
+        standIn.onSignal = { _, envelope in
+            received.payloads.append(envelope.payload)
+            if case .answer = envelope.payload { host.handle(envelope.payload) }
+            if case .candidate = envelope.payload { host.handle(envelope.payload) }
+        }
+
+        laptop.connect(to: studio)
+        try await poll("request arrives") { received.payloads.contains(.request) }
+        #expect(laptop.sessionQuality == nil)
+        // Chosen in the session before the channels are open; the saved default stays.
+        laptop.sessionQuality = .balanced
+        host.start()
+        try await poll("quality asked for") { received.input.contains(.quality(.balanced)) }
+        try await Task.sleep(for: .milliseconds(500))
+        // The session's choice, once, and not the saved Light.
+        #expect(received.input.filter { if case .quality = $0 { true } else { false } } == [.quality(.balanced)])
+        #expect(laptop.preferredQuality == .light)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aWaitingCallCanBeSeenAndCancelled() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        let studioAtLaptop = try #require(laptop.controllable.first)
+
+        laptop.goOnline()
+        laptop.connect(to: studioAtLaptop)
+        #expect(laptop.hostAwaitingServer == studioAtLaptop)
+        laptop.disconnect()
+        #expect(laptop.hostAwaitingServer == nil)
+
+        // Forgotten while waiting: the wait ends with it.
+        laptop.goOnline()
+        laptop.connect(to: studioAtLaptop)
+        laptop.forget(studioAtLaptop)
+        #expect(laptop.hostAwaitingServer == nil)
+        try await poll("online again") { laptop.signalingStatus == .online }
+        #expect(laptop.controllerStatus == .idle)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aCallMadeWhileReconnectingWaitsForTheServer() async throws {
         let server = try await LocalServer.start()
         defer { server.stop() }

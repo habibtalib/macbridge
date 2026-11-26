@@ -125,6 +125,26 @@ private enum Posted: Equatable {
 
 private final class FakeStream {}
 
+@Suite struct StopBudgetTests {
+    /// Which of the stops, at these seconds, reach the budget.
+    private func outcomes(_ seconds: [TimeInterval]) -> [Bool] {
+        var budget = StopBudget()
+        let start = Date()
+        return seconds.map { budget.recordStop(at: start.addingTimeInterval($0)) }
+    }
+
+    /// A display whose stream keeps stopping while restarts succeed must not restart for ever.
+    @Test func stopsCloseTogetherEndTheSession() {
+        #expect(outcomes([0, 2, 4]) == [false, false, true])
+    }
+
+    /// A lid closed now and again, minutes apart, never adds up.
+    @Test func aQuietSpellStartsTheCountAgain() {
+        #expect(outcomes([0, 3, 14, 60, 130]) == [false, false, false, false, false])
+        #expect(outcomes([0, 9, 15, 18]) == [false, false, false, true])
+    }
+}
+
 @Suite struct StreamSlotTests {
     // #expect cannot wrap a mutating call: results are taken first.
 

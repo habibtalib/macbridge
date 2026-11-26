@@ -89,7 +89,7 @@ struct RootView: View {
     @EnvironmentObject private var model: BridgeModel
 
     var body: some View {
-        content.background(SessionCloseGuardView(model: model))
+        content.background(SessionCloseGuardView(model: model, status: model.controllerStatus))
     }
 
     @ViewBuilder private var content: some View {
@@ -117,6 +117,8 @@ struct RootView: View {
 /// Puts `SessionCloseGuard` on the window this view is in.
 private struct SessionCloseGuardView: NSViewRepresentable {
     let model: BridgeModel
+    /// Unused here, but a change runs updateNSView, which puts the guard back if needed.
+    let status: BridgeModel.ControllerStatus
 
     func makeCoordinator() -> SessionCloseGuard { SessionCloseGuard(model: model) }
 
@@ -152,18 +154,31 @@ final class SessionCloseGuard: NSObject, NSWindowDelegate {
     private let model: BridgeModel
     private weak var window: NSWindow?
     private var original: NSWindowDelegate?
+    private var keyObserver: NSObjectProtocol?
 
     init(model: BridgeModel) { self.model = model }
 
+    /// Becomes the window's delegate, again if SwiftUI has set its own since.
     func attach(to window: NSWindow?) {
         guard let window, window.delegate !== self else { return }
-        detach()
+        if window !== self.window {
+            detach()
+            self.window = window
+            // SwiftUI may replace the delegate without this view being updated: look again
+            // whenever the window comes to the front.
+            keyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { [weak self, weak window] _ in
+                MainActor.assumeIsolated { self?.attach(to: window) }
+            }
+        }
         original = window.delegate
-        self.window = window
         window.delegate = self
     }
 
     func detach() {
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        keyObserver = nil
         if let window, window.delegate === self { window.delegate = original }
         window = nil
         original = nil
@@ -241,7 +256,10 @@ private struct MenuBarContent: View {
             Text("Connecting to \(model.displayName(host))…")
             Button("Cancel") { model.disconnect() }
         case .idle, .failed:
-            EmptyView()
+            if let waiting = model.hostAwaitingServer {
+                Text("Connecting to \(model.displayName(waiting))… (waiting for server)")
+                Button("Cancel") { model.disconnect() }
+            }
         }
         Divider()
         Button("Open MacBridge", action: showWindow)
