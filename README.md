@@ -1,8 +1,52 @@
+<div align="center">
+
+<img src="docs/images/logo.png" width="128" alt="MacBridge logo">
+
 # MacBridge
 
-Control one Mac from another, from anywhere. One app on both Macs; a small server you host introduces them, then screen and input travel directly between the two Macs over WebRTC.
+**Control one Mac from another, from anywhere.**<br>
+Peer-to-peer screen and input over WebRTC, end-to-end signed, with a tiny server you host yourself.
 
-Status: early; used between Macs on a private network (Tailscale), not yet tried over the open internet. Working name.
+[![Release](https://img.shields.io/github/v/release/habibtalib/macbridge?style=flat-square&color=4057e8)](https://github.com/habibtalib/macbridge/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/habibtalib/macbridge/total?style=flat-square&color=4057e8)](https://github.com/habibtalib/macbridge/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![macOS 15+](https://img.shields.io/badge/macOS-15%2B-black?style=flat-square&logo=apple)](#install-on-a-mac)
+[![iOS](https://img.shields.io/badge/iPhone%20%26%20iPad-controller-black?style=flat-square&logo=apple)](#iphone-and-ipad)
+[![Swift](https://img.shields.io/badge/Swift-5-F05138?style=flat-square&logo=swift&logoColor=white)](Packages/BridgeCore)
+[![Stars](https://img.shields.io/github/stars/habibtalib/macbridge?style=flat-square&color=yellow)](https://github.com/habibtalib/macbridge/stargazers)
+
+[**Download**](https://github.com/habibtalib/macbridge/releases/latest) · [Install](#install-on-a-mac) · [How it works](#how-it-works) · [Self-host the server](docs/server-setup.md) · [Changelog](CHANGELOG.md)
+
+<img src="docs/images/banner.png" alt="MacBridge home window with paired Macs and a live session" width="100%">
+
+<sub>Illustration with example Mac names.</sub>
+
+</div>
+
+## Why MacBridge
+
+- 🖥️ **Your Macs, no middleman.** Video and input go straight between the two Macs; the server only introduces them.
+- 🔐 **Signed end to end.** Ed25519 keys per install, one-time pairing codes, and both sides sign the connection, so the server can't read, alter or start a session.
+- ⚡ **Hardware H.264.** Retina-sized screens at up to 60 fps, with Sharp, Balanced and Light presets.
+- 📋 **Feels local.** Mouse, keyboard, ⌘ shortcuts, two-way clipboard, desktop switching, multiple displays.
+- 😴 **Always reachable.** Opens at login, stays awake while control is allowed, even with the lid closed (via [LidAwake](https://github.com/habibtalib/lidawake)).
+- 📱 **iPhone and iPad.** Touch or trackpad pointer, pinch zoom, on-screen and hardware keyboard.
+- 🏠 **Self-hosted.** One Node service plus an optional TURN relay, Docker Compose included. Works great over Tailscale.
+
+## How it works
+
+<!-- how-it-works-video -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+  <img src="docs/images/how-it-works-light.svg" alt="Both Macs log in to the signaling server, exchange a signed offer and answer, then stream screen and input directly over WebRTC" width="100%">
+</picture>
+
+1. Both Macs log in to your signaling server with the access token and their own key.
+2. Pair once: the Mac to be controlled shows a code or QR code, the other Mac types or scans it.
+3. Connecting sends a signed offer and answer through the server; then screen, input and clipboard flow directly between the Macs (relayed through TURN only when a direct path is impossible).
+
+Status: early; used between Macs on a private network (Tailscale), not yet tried over the open internet.
 
 ## Install on a Mac
 
@@ -20,28 +64,6 @@ Needs macOS 15 or later on Apple silicon, on both Macs.
 4. Open MacBridge and continue with [Set up](#set-up): a signaling server, then pairing.
 
 On the Mac to be controlled, macOS asks for **Screen Recording** and **Accessibility**. Grant both in **Settings → Security**, then reopen the app. If you later replace the app with a build signed by someone else, remove MacBridge from both lists and grant again.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `App/` | Mac app (home window, session window, settings) |
-| `Mobile/` | iPhone and iPad app (controller only) |
-| `Packages/BridgeCore/` | Everything else: input protocol, signaling client, WebRTC session, screen capture, input injection |
-| `server/` | Signaling server (Node 24, TypeScript, `ws`) |
-
-## Build
-
-Requires Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node 24+ and pnpm.
-
-```sh
-export DEVELOPMENT_TEAM=XXXXXXXXXX   # your Apple team ID (Xcode → Settings → Accounts)
-xcodegen generate
-xcodebuild -project MacBridge.xcodeproj -scheme MacBridge -derivedDataPath build build
-open build/Build/Products/Debug/MacBridge.app
-```
-
-Builds are signed with your development identity; `project.yml` reads the team ID from `DEVELOPMENT_TEAM`. macOS ties the Screen Recording and Accessibility grants to the signature, so do not switch to ad-hoc signing. `scripts/package.sh` makes a Release zip in `dist/`; with `NOTARY_PROFILE` and a Developer ID certificate it also notarises.
 
 ## Set up
 
@@ -106,15 +128,37 @@ open MacBridge.xcodeproj      # choose the MacBridgeMobile scheme and your devic
 - **More menu:** desktops, Mission Control, Spotlight, switch app, lock, quality, connection details, and the clipboard: *Send Clipboard to Mac* and *Get Mac's Clipboard* (manual, because iOS asks for permission on every automatic read).
 - The session ends when the app goes to the background. Coming back offers to reconnect.
 
+## Security
+
+Each install has an Ed25519 key in the keychain; its device ID is derived from the key. The server checks the access token and that a device holds its key, and nothing more. A session starts only when a paired device sends a signed, fresh request, and both sides sign the certificate fingerprints of the encrypted connection, so the server cannot read, alter or start a session. See the end of [docs/server-setup.md](docs/server-setup.md) for what a compromised server could still do.
+
 ## Limits
 
 - After a restart the controlled Mac is reachable only once someone has logged in. Use automatic login if it must come back unattended.
 - It stays awake while control is allowed. A closed laptop sleeps unless *With the lid closed* is set (see above).
 - No file transfer or audio.
 
-## Security
+## Build from source
 
-Each install has an Ed25519 key in the keychain; its device ID is derived from the key. The server checks the access token and that a device holds its key, and nothing more. A session starts only when a paired device sends a signed, fresh request, and both sides sign the certificate fingerprints of the encrypted connection, so the server cannot read, alter or start a session. See the end of [docs/server-setup.md](docs/server-setup.md) for what a compromised server could still do.
+Requires Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node 24+ and pnpm.
+
+```sh
+export DEVELOPMENT_TEAM=XXXXXXXXXX   # your Apple team ID (Xcode → Settings → Accounts)
+xcodegen generate
+xcodebuild -project MacBridge.xcodeproj -scheme MacBridge -derivedDataPath build build
+open build/Build/Products/Debug/MacBridge.app
+```
+
+Builds are signed with your development identity; `project.yml` reads the team ID from `DEVELOPMENT_TEAM`. macOS ties the Screen Recording and Accessibility grants to the signature, so do not switch to ad-hoc signing. `scripts/package.sh` makes a Release zip in `dist/`; with `NOTARY_PROFILE` and a Developer ID certificate it also notarises.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `App/` | Mac app (home window, session window, settings) |
+| `Mobile/` | iPhone and iPad app (controller only) |
+| `Packages/BridgeCore/` | Everything else: input protocol, signaling client, WebRTC session, screen capture, input injection |
+| `server/` | Signaling server (Node 24, TypeScript, `ws`) |
 
 ## Tests
 
@@ -124,6 +168,10 @@ cd server && pnpm test && pnpm typecheck
 ```
 
 The WebRTC loopback test runs a host and a controller in one process and checks hardware H.264 video and both input channels end to end. The client ↔ server tests need `server/node_modules`.
+
+## Contributing
+
+Issues and pull requests are welcome. Run the tests above before sending a change, and keep the README in step with what the app does.
 
 ## License
 
