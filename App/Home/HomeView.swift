@@ -161,6 +161,54 @@ private struct ConnectBar: View {
 
 // MARK: - Devices
 
+/// Tiles in as many columns as fit, each between `minWidth` and `maxWidth` wide, left-aligned;
+/// each row is as tall as its tallest tile.
+struct TileGrid: Layout {
+    var minWidth: CGFloat
+    var maxWidth: CGFloat
+    var spacing: CGFloat
+
+    private func columns(for width: CGFloat) -> (count: Int, width: CGFloat) {
+        // SwiftUI also measures with an unbounded width (.infinity) or none.
+        guard width.isFinite, width > 0 else { return (1, minWidth) }
+        let count = max(1, Int((width + spacing) / (minWidth + spacing)))
+        let fitted = (width - spacing * CGFloat(count - 1)) / CGFloat(count)
+        return (count, min(maxWidth, max(0, fitted)))
+    }
+
+    private func rowHeights(_ subviews: Subviews, count: Int, width: CGFloat) -> [CGFloat] {
+        stride(from: 0, to: subviews.count, by: count).map { start in
+            subviews[start..<min(start + count, subviews.count)]
+                .map { $0.sizeThatFits(ProposedViewSize(width: width, height: nil)).height }
+                .max() ?? 0
+        }
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let available = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? minWidth
+        let (count, width) = columns(for: available)
+        let heights = rowHeights(subviews, count: count, width: width)
+        let height = heights.reduce(0, +) + spacing * CGFloat(max(0, heights.count - 1))
+        return CGSize(width: max(available, width), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let (count, width) = columns(for: bounds.width)
+        let heights = rowHeights(subviews, count: count, width: width)
+        var y = bounds.minY
+        for (row, height) in heights.enumerated() {
+            for column in 0..<count {
+                let index = row * count + column
+                guard index < subviews.count else { break }
+                let x = bounds.minX + CGFloat(column) * (width + spacing)
+                subviews[index].place(at: CGPoint(x: x, y: y), anchor: .topLeading,
+                                      proposal: ProposedViewSize(width: width, height: height))
+            }
+            y += height + spacing
+        }
+    }
+}
+
 private enum DeviceFilter: String, CaseIterable, Identifiable {
     case all, online, favourites
     var id: String { rawValue }
@@ -300,7 +348,9 @@ private struct DeviceGrid: View {
                     .padding(.top, 8)
             } else {
                 ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 20)], alignment: .leading, spacing: 20) {
+                    // Not LazyVGrid: in a window that opens with its last size, the lazy grid left
+                    // the tiles undrawn until the window was resized. A paired-Mac list is short.
+                    TileGrid(minWidth: 250, maxWidth: 360, spacing: 20) {
                         ForEach(devices) { device in
                             DeviceTile(device: device,
                                        rename: { newName = model.displayName(device); renaming = device },
