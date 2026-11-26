@@ -35,7 +35,9 @@ Peer-to-peer screen and input over WebRTC, end-to-end signed, with a tiny server
 
 ## How it works
 
-<!-- how-it-works-video -->
+<a href="https://github.com/habibtalib/macbridge/releases/download/v0.1.0/macbridge-how-it-works.mp4"><img src="docs/how-it-works.png" alt="MacBridge how it works video: two Macs, your server introduces them, pair once, then screen and input go straight Mac to Mac" width="100%"></a>
+
+▶ Watch the 43-second video: [how it works](https://github.com/habibtalib/macbridge/releases/download/v0.1.0/macbridge-how-it-works.mp4) (also in [docs/how-it-works.mp4](docs/how-it-works.mp4)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
