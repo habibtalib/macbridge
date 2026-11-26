@@ -37,9 +37,11 @@ public final class BridgeModel: ObservableObject {
         case showingCode(String, expires: Date)
         /// This Mac sent a typed code and is waiting for the other Mac.
         case waiting
-        /// A pairing link names another server than the one set. Switching waits for
-        /// a yes, so a link cannot move this device to a server nobody chose.
-        case confirmServer(String)
+        /// A pairing link names another server than the one set, or names the first server
+        /// while an access token is waiting for one. Switching waits for a yes, so a link
+        /// cannot move this device, or its token, to a server nobody chose. `sendsToken`:
+        /// the token entered with no server set goes to this one.
+        case confirmServer(String, sendsToken: Bool)
         case failed(String)
     }
 
@@ -396,6 +398,8 @@ public final class BridgeModel: ObservableObject {
             notice = code == "bad-token"
                 ? "The server refused the access token."
                 : "The server refused this device (\(code))."
+        case .unsupported:
+            break // never passed on by the client
         case let .other(code):
             notice = "Server error: \(code)"
         }
@@ -426,23 +430,24 @@ public final class BridgeModel: ObservableObject {
         }
     }
 
-    /// Pairs from a scanned or opened pairing link. With no server set yet it takes the
-    /// link's server; another server than the one set waits for `confirmServerSwitch()`.
+    /// Pairs from a scanned or opened pairing link. With no server and no token set yet it
+    /// takes the link's server; otherwise another server waits for `confirmServerSwitch()`.
     /// Offline, it goes online and pairs once the server answers.
     public func pair(using link: PairingLink) {
         if let server = link.server, Self.serverKey(server) != Self.serverKey(serverURL) {
-            if canGoOnline {
-                // A link can come from anyone: ask before leaving the server the user chose.
+            // A link can come from anyone: ask before leaving the server the user chose, or
+            // before sending it the token the user entered.
+            if canGoOnline || !accessToken.isEmpty {
                 guard !inSession else {
                     pairingStatus = .failed("End the current session before pairing with another server.")
                     return
                 }
                 cancelPairing()
                 linkAwaitingConfirm = link
-                pairingStatus = .confirmServer(server)
+                pairingStatus = .confirmServer(server, sendsToken: !canGoOnline)
                 return
             }
-            // First-time setup: the link's server becomes this device's server.
+            // First-time setup with nothing to lose: the link's server becomes this device's server.
             serverURL = server
             goOnline()
         } else if signalingStatus == .offline, canGoOnline {
@@ -451,8 +456,9 @@ public final class BridgeModel: ObservableObject {
         continuePairing(link)
     }
 
-    /// Switches to the server of the link waiting in `.confirmServer`, with that server's own
-    /// token (none if it is new), and pairs.
+    /// Switches to the server of the link waiting in `.confirmServer` and pairs. Leaving a set
+    /// server, it uses the new server's own token (none if it is new); with no server set, the
+    /// token entered goes with it.
     public func confirmServerSwitch() {
         guard let link = linkAwaitingConfirm, let server = link.server else { return }
         linkAwaitingConfirm = nil
@@ -460,7 +466,7 @@ public final class BridgeModel: ObservableObject {
             pairingStatus = .failed("End the current session before pairing with another server.")
             return
         }
-        switchingByLink = true
+        switchingByLink = canGoOnline
         serverURL = server
         switchingByLink = false
         goOnline()
@@ -517,9 +523,9 @@ public final class BridgeModel: ObservableObject {
     }
 
     /// Keeps each server's token with that server. A confirmed link loads the new server's
-    /// own token, empty if it has none. An edit in Settings loads the new server's token if it
-    /// has one, otherwise the token being shown moves with the edit (typing the address goes
-    /// through many partial ones; the user is changing where this token goes).
+    /// own token, empty if it has none. A server committed in Settings loads its own token if
+    /// it has one, otherwise the token shown is copied to it: the old server keeps its token.
+    /// Only a token not yet tied to a server moves.
     private func serverChanged(from old: String) {
         let oldKey = Self.serverKey(old), newKey = Self.serverKey(serverURL)
         guard oldKey != newKey else { return }
@@ -529,8 +535,16 @@ public final class BridgeModel: ObservableObject {
         } else {
             let carried = accessToken
             accessToken = carried
-            secrets.setToken("", oldKey)
+            if oldKey.isEmpty { secrets.setToken("", oldKey) }
         }
+    }
+
+    /// Applies the Settings connection fields once they are committed (submit, leaving the
+    /// field, Go online), not on every keystroke. `token` nil: the token field was not edited,
+    /// so the server's own token is loaded.
+    public func applyConnectionSettings(server: String, token: String?) {
+        if server != serverURL { serverURL = server }
+        if let token, token != accessToken { accessToken = token }
     }
 
     /// Takes away that device's right to control this Mac.

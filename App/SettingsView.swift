@@ -145,12 +145,24 @@ private struct SecuritySettings: View {
 
 private struct ConnectionSettings: View {
     @EnvironmentObject private var model: BridgeModel
+    // Server and token are edited as drafts and applied on Return, on leaving the field, on
+    // Go online or on closing: each server keeps its own token, and a half-typed address must
+    // not count as a server.
+    @State private var serverDraft = ""
+    @State private var tokenDraft = ""
+    @State private var tokenLoaded = ""
+    @FocusState private var focused: Field?
+    private enum Field { case server, token }
 
     var body: some View {
         Form {
             Section {
-                TextField("Server", text: $model.serverURL, prompt: Text("wss://bridge.example.com"))
-                SecureField("Access token", text: $model.accessToken)
+                TextField("Server", text: $serverDraft, prompt: Text("wss://bridge.example.com"))
+                    .focused($focused, equals: .server)
+                    .onSubmit(commit)
+                SecureField("Access token", text: $tokenDraft)
+                    .focused($focused, equals: .token)
+                    .onSubmit(commit)
                 Toggle("Always relay through the server", isOn: $model.forcesRelay)
             } footer: {
                 Text("The server only introduces the two Macs. Changes apply the next time this Mac goes online.")
@@ -164,15 +176,38 @@ private struct ConnectionSettings: View {
                     }
                     Spacer()
                     if model.signalingStatus == .offline {
-                        Button("Go online") { model.goOnline() }.disabled(!model.canGoOnline)
+                        Button("Go online", action: commitAndGoOnline).disabled(!draftIsValid)
                     } else {
-                        Button("Reconnect") { model.goOnline() }.disabled(!model.canGoOnline)
+                        Button("Reconnect", action: commitAndGoOnline).disabled(!draftIsValid)
                         Button("Go offline") { model.goOffline() }
                     }
                 }
             }
         }
         .formStyle(.grouped)
+        .onAppear(perform: load)
+        .onDisappear(perform: commit)
+        .onChange(of: focused) { old, new in if old != nil, new != old { commit() } }
+        // A confirmed pairing link may switch the server while this is open.
+        .onChange(of: model.serverURL) { _, _ in if focused == nil { load() } }
+    }
+
+    private var draftIsValid: Bool { BridgeModel.parseServerURL(serverDraft) != nil }
+
+    private func load() {
+        serverDraft = model.serverURL
+        tokenDraft = model.accessToken
+        tokenLoaded = model.accessToken
+    }
+
+    private func commit() {
+        model.applyConnectionSettings(server: serverDraft, token: tokenDraft == tokenLoaded ? nil : tokenDraft)
+        load()
+    }
+
+    private func commitAndGoOnline() {
+        commit()
+        model.goOnline()
     }
 }
 

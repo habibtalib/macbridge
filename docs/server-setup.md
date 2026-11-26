@@ -45,11 +45,14 @@ The signaling service protects itself from a misbehaving or hostile client. Each
 | `RATE_LIMIT_PER_SECOND` | 50 | Messages one connection may send per second, on average. Over the limit the connection gets `rate-limited` and is closed (code 4004). |
 | `RATE_LIMIT_BURST` | 100 | Messages one connection may send at once before the average applies. |
 | `MAX_BUFFERED_BYTES` | 1048576 | A device that reads too slowly is dropped once this much waits to be sent to it. |
-| `MAX_CONNECTIONS` | 1000 | Connections in total. More get `busy` and are closed (code 4005). |
+| `MAX_CONNECTIONS` | 1000 | Connections in total. More are refused with HTTP 503 before the WebSocket opens, and the app retries later. |
 | `MAX_CONNECTIONS_PER_IP` | 20 | Connections from one address. |
-| `TRUST_PROXY` | 1 in `docker-compose.yml`, else off | `1` counts connections by the last address in `X-Forwarded-For`. Use it only when the service is reachable through your reverse proxy alone, as in `docker-compose.yml`; otherwise every client shares the proxy's address, or a client could name any address. |
+| `TRUST_PROXY` | 1 in `docker-compose.yml`, else off | `1` counts connections by the client address in `X-Forwarded-For`. Use it only when the service is reachable through your reverse proxy alone, as in `docker-compose.yml`. |
+| `TRUST_PROXY_HOPS` | 1 | How many proxies append to `X-Forwarded-For`. The client is the entry this many places from the end; entries before it are whatever the client sent and are ignored. |
 
-A message type the server does not know gets `{"type":"error","code":"unsupported"}` and the connection stays open.
+With `TRUST_PROXY=1` the reverse proxy **must** set or append `X-Forwarded-For` with the address it was reached from. Caddy does this by default; for nginx use `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. A proxy that passes the header through unchanged lets any client name any address and dodge the per-address limit. Without the header, every client counts as the proxy's own address and shares one `MAX_CONNECTIONS_PER_IP` allowance.
+
+A message type the server does not know gets `{"type":"error","code":"unsupported","messageType":"<type>"}` and the connection stays open.
 
 coturn in `docker-compose.yml` refuses to relay to private, loopback and link-local addresses (IPv4 and IPv6) and to the server's own `PUBLIC_IP`, and its admin console is off (`--no-cli`).
 

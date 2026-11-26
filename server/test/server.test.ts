@@ -1,5 +1,6 @@
 import { createHmac, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
+import { connect, type Socket } from "node:net";
 import { WebSocket } from "ws";
 import {
   CLOSE,
@@ -13,6 +14,7 @@ import {
 
 let server: SignalingServer;
 const sockets: WebSocket[] = [];
+const rawSockets: Socket[] = [];
 
 async function start(options: Partial<SignalingServerOptions> = {}) {
   server = await startSignalingServer({ port: 0, host: "127.0.0.1", ...options });
@@ -20,6 +22,7 @@ async function start(options: Partial<SignalingServerOptions> = {}) {
 
 afterEach(async () => {
   for (const socket of sockets.splice(0)) socket.terminate();
+  for (const socket of rawSockets.splice(0)) socket.destroy();
   await server?.close();
 });
 
@@ -243,7 +246,7 @@ describe("relay", () => {
     await start();
     const device = await Device.online();
     device.send({ type: "nope" });
-    expect(await device.next()).toEqual({ type: "error", code: "unsupported" });
+    expect(await device.next()).toEqual({ type: "error", code: "unsupported", messageType: "nope" });
     device.send({ type: "ice" });
     expect(await device.next()).toEqual({ type: "ice", servers: [] });
   });
@@ -411,6 +414,32 @@ describe("limits", () => {
     expect(await device.closed).toBe(CLOSE.rateLimited);
   });
 
+  /** Opens a WebSocket and reports the HTTP status it was refused with, or "open". */
+  const attempt = (headers: Record<string, string> = {}) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}`, { headers });
+    sockets.push(socket);
+    return new Promise<number | "open">((resolve) => {
+      socket.once("open", () => resolve("open"));
+      socket.once("unexpected-response", (_request, response) => resolve(response.statusCode ?? 0));
+      socket.once("error", () => {});
+    });
+  };
+
+  /** A raw upgrade request whose client never reads, answers or closes anything. */
+  const silentUpgrade = () =>
+    new Promise<Socket>((resolve) => {
+      const tcp = connect(server.port, "127.0.0.1", () => {
+        tcp.write(
+          "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        resolve(tcp);
+      });
+      tcp.pause();
+      tcp.on("error", () => {});
+      rawSockets.push(tcp);
+    });
+
   it.each([
     { maxConnections: 2, maxConnectionsPerIp: 10 },
     { maxConnections: 10, maxConnectionsPerIp: 2 },
@@ -418,9 +447,7 @@ describe("limits", () => {
     await start({ limits });
     const first = await Device.online();
     await Device.online();
-    const third = await Device.open();
-    expect(await third.next()).toEqual({ type: "error", code: "busy" });
-    expect(await third.closed).toBe(CLOSE.busy);
+    expect(await attempt()).toBe(503);
 
     // A slot frees up when a connection ends.
     first.socket.close();
@@ -428,19 +455,32 @@ describe("limits", () => {
     await Device.online();
   });
 
+  it("does not let refused connections hold a slot", async () => {
+    await start({ limits: { maxConnections: 2 } });
+    const first = await Device.online();
+    await Device.online();
+    // Refused clients that never finish anything.
+    for (let i = 0; i < 5; i++) await silentUpgrade();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    first.socket.terminate();
+    await first.closed;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await Device.online();
+  });
+
   it("counts the address the proxy names when told to trust it", async () => {
     await start({ limits: { maxConnectionsPerIp: 1 }, trustProxy: true });
-    const viaProxy = (ip: string) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${server.port}`, { headers: { "x-forwarded-for": `198.51.100.9, ${ip}` } });
-      sockets.push(socket);
-      return new Promise<number | "open">((resolve) => {
-        socket.once("close", (code) => resolve(code));
-        socket.once("message", () => socket.once("close", (code) => resolve(code)));
-        setTimeout(() => resolve("open"), 300);
-      });
-    };
-    expect(await viaProxy("203.0.113.1")).toBe("open");
-    expect(await viaProxy("203.0.113.2")).toBe("open");
-    expect(await viaProxy("203.0.113.1")).toBe(CLOSE.busy);
+    const from = (ip: string) => ({ "x-forwarded-for": `198.51.100.9, ${ip}` });
+    expect(await attempt(from("203.0.113.1"))).toBe("open");
+    expect(await attempt(from("203.0.113.2"))).toBe("open");
+    expect(await attempt(from("203.0.113.1"))).toBe(503);
+  });
+
+  it("takes the entry as many hops from the end as there are proxies", async () => {
+    await start({ limits: { maxConnectionsPerIp: 1 }, trustProxy: true, trustProxyHops: 2 });
+    // The second-last entry is the client; the last is the outer proxy.
+    expect(await attempt({ "x-forwarded-for": "spoofed, 203.0.113.1, 10.0.0.2" })).toBe("open");
+    expect(await attempt({ "x-forwarded-for": "other, 203.0.113.1, 10.0.0.2" })).toBe(503);
+    expect(await attempt({ "x-forwarded-for": "203.0.113.1, 203.0.113.3, 10.0.0.2" })).toBe("open");
   });
 });

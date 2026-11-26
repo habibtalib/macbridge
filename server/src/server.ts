@@ -1,4 +1,5 @@
 import { createHash, createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto";
+import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 
 /**
@@ -28,7 +29,9 @@ import { WebSocketServer, WebSocket } from "ws";
  *   { type: "error", code, to? }        offline, no-such-pairing, bad-message,
  *                                       bad-id, bad-token, bad-auth, hello-timeout,
  *                                       unsupported (a type this server does not know;
- *                                       the connection stays open), rate-limited, busy
+ *                                       the connection stays open; messageType names
+ *                                       it), rate-limited
+ * A connection over the connection limits is refused at the upgrade with HTTP 503.
  */
 
 const ID_PATTERN = /^[a-z2-7]{16}$/;
@@ -61,7 +64,6 @@ export const CLOSE = {
   helloTimeout: 4002,
   unauthorized: 4003,
   rateLimited: 4004,
-  busy: 4005,
 } as const;
 
 export interface TurnOptions {
@@ -84,11 +86,13 @@ export interface SignalingServerOptions {
   /** Rate and connection limits; anything not given takes its `DEFAULT_LIMITS` value. */
   limits?: Partial<Limits>;
   /**
-   * Count connections per IP by the last X-Forwarded-For address. Only for a server that
-   * is reachable through a reverse proxy alone, which sets that header; otherwise every
-   * connection would share the proxy's address.
+   * Count connections per IP by the X-Forwarded-For header. Only for a server reachable
+   * through reverse proxies alone, each of which appends the address it was reached from;
+   * otherwise a client could name any address, or every client would share the proxy's.
    */
   trustProxy?: boolean;
+  /** How many proxies append to X-Forwarded-For: the client is the entry this far from the end. Default 1. */
+  trustProxyHops?: number;
   /** Clock, for tests. */
   now?: () => number;
 }
@@ -179,10 +183,42 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
     if (value !== undefined) limits[name] = value;
   }
   const perIp = new Map<string, number>();
-  const wss = new WebSocketServer({
-    port: options.port,
-    host: options.host,
-    maxPayload: MAX_MESSAGE_BYTES,
+  let connections = 0;
+  const http = createServer((_request, response) => {
+    response.writeHead(426, { "Content-Type": "text/plain" }).end("Upgrade Required");
+  });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
+
+  const clientAddress = (request: IncomingMessage): string => {
+    const direct = request.socket.remoteAddress ?? "unknown";
+    if (!options.trustProxy) return direct;
+    const header = request.headers["x-forwarded-for"];
+    const entries = (Array.isArray(header) ? header.join(",") : (header ?? ""))
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const hops = Math.max(1, options.trustProxyHops ?? 1);
+    return entries[entries.length - hops] ?? entries[0] ?? direct;
+  };
+
+  // Limits are checked before the WebSocket exists, so a refused connection never holds a
+  // slot, whatever its client does next. A slot is freed when the TCP connection closes.
+  http.on("upgrade", (request, tcp, head) => {
+    const ip = clientAddress(request);
+    if (connections >= limits.maxConnections || (perIp.get(ip) ?? 0) >= limits.maxConnectionsPerIp) {
+      tcp.once("finish", () => tcp.destroy());
+      tcp.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      return;
+    }
+    connections += 1;
+    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+    tcp.once("close", () => {
+      connections -= 1;
+      const left = (perIp.get(ip) ?? 1) - 1;
+      if (left > 0) perIp.set(ip, left);
+      else perIp.delete(ip);
+    });
+    wss.handleUpgrade(request, tcp, head, (socket) => wss.emit("connection", socket, request));
   });
 
   const send = (socket: WebSocket, message: object) => {
@@ -199,20 +235,7 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
     client.pairing = null;
   };
 
-  wss.on("connection", (socket, request) => {
-    const forwarded = options.trustProxy ? request.headers["x-forwarded-for"] : undefined;
-    const ip =
-      (typeof forwarded === "string" ? forwarded.split(",").pop()?.trim() : undefined) ||
-      request.socket.remoteAddress ||
-      "unknown";
-    // wss.clients already holds this connection.
-    if (wss.clients.size > limits.maxConnections || (perIp.get(ip) ?? 0) >= limits.maxConnectionsPerIp) {
-      send(socket, { type: "error", code: "busy" });
-      socket.close(CLOSE.busy);
-      return;
-    }
-    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
-
+  wss.on("connection", (socket: WebSocket) => {
     const client: Client = {
       socket,
       id: null,
@@ -348,14 +371,11 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
         default:
           if (typeof type !== "string" || Array.isArray(message)) return reject("bad-message");
           // A newer client may know types this server does not: say so and stay connected.
-          return send(socket, { type: "error", code: "unsupported" });
+          return send(socket, { type: "error", code: "unsupported", messageType: type });
       }
     });
 
     socket.on("close", () => {
-      const left = (perIp.get(ip) ?? 1) - 1;
-      if (left > 0) perIp.set(ip, left);
-      else perIp.delete(ip);
       clearTimeout(helloTimer);
       closePairing(client);
       if (client.id !== null && devices.get(client.id) === client) {
@@ -381,9 +401,9 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
   pinger.unref();
 
   return new Promise((resolve, reject) => {
-    wss.once("error", reject);
-    wss.once("listening", () => {
-      const address = wss.address();
+    http.once("error", reject);
+    http.listen(options.port, options.host, () => {
+      const address = http.address();
       const port = typeof address === "object" && address !== null ? address.port : options.port;
       resolve({
         port,
@@ -391,7 +411,9 @@ export function startSignalingServer(options: SignalingServerOptions): Promise<S
           new Promise<void>((done) => {
             clearInterval(pinger);
             for (const socket of wss.clients) socket.terminate();
-            wss.close(() => done());
+            wss.close();
+            http.closeAllConnections();
+            http.close(() => done());
           }),
       });
     });

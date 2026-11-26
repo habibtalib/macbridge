@@ -51,6 +51,7 @@ const server = await startSignalingServer({
     maxConnectionsPerIp: count("MAX_CONNECTIONS_PER_IP"),
   },
   trustProxy: env.TRUST_PROXY === "1",
+  trustProxyHops: count("TRUST_PROXY_HOPS"),
   log: (line) => console.log(new Date().toISOString(), line),
 });
 console.log(

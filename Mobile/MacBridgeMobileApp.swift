@@ -41,14 +41,6 @@ struct RootScreen: View {
     /// A session that iOS ended by putting the app in the background.
     @State private var interrupted: PairedDevice?
 
-    private var confirmServer: String? {
-        if case let .confirmServer(server) = model.pairingStatus { return server }
-        return nil
-    }
-
-    private var confirmServerHost: String {
-        confirmServer.map { URL(string: $0)?.host ?? $0 } ?? ""
-    }
 
     var body: some View {
         Group {
@@ -92,12 +84,13 @@ struct RootScreen: View {
             Text("The session with \(interrupted.map(model.displayName) ?? "the Mac") ended when MacBridge went to the background.")
         }
         // A pairing link may come from anyone: switching to the server it names needs a yes.
-        .alert("Use another server?", isPresented: Binding(get: { confirmServer != nil }, set: { _ in })) {
+        // HomeScreen shows the same question inline, in case this alert cannot be presented.
+        .alert(model.pairingStatus.serverToConfirm?.title ?? "", isPresented: Binding(get: { model.pairingStatus.serverToConfirm != nil }, set: { _ in })) {
             // Each button settles the status, which closes the alert.
-            Button("Use \(confirmServerHost)") { model.confirmServerSwitch() }
+            Button("Use \(model.pairingStatus.serverToConfirm?.host ?? "")") { model.confirmServerSwitch() }
             Button("Cancel", role: .cancel) { model.cancelPairing() }
         } message: {
-            Text("This pairing code is for the server \(confirmServerHost), not the one set in Settings. Switch only if you trust it. Your access token stays with the current server.")
+            Text(model.pairingStatus.serverToConfirm?.message ?? "")
         }
     }
 }
@@ -158,5 +151,24 @@ enum Thumbnails {
         guard let deviceID, let data = video.thumbnailJPEG() else { return }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try? data.write(to: url(for: deviceID), options: .atomic)
+    }
+}
+
+/// The question to ask while a pairing link waits for a yes to use its server.
+struct ServerConfirmation {
+    let host: String
+    let title: String
+    let message: String
+}
+
+extension BridgeModel.PairingStatus {
+    var serverToConfirm: ServerConfirmation? {
+        guard case let .confirmServer(server, sendsToken) = self else { return nil }
+        let host = URL(string: server)?.host ?? server
+        return sendsToken
+            ? ServerConfirmation(host: host, title: "Use this server?",
+                                 message: "This pairing code is for the server \(host). Use this server with your access token only if you trust it.")
+            : ServerConfirmation(host: host, title: "Use another server?",
+                                 message: "This pairing code is for the server \(host), not the one set in Settings. Switch only if you trust it. Your access token stays with the current server.")
     }
 }

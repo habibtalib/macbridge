@@ -281,7 +281,18 @@ struct BridgeModelTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
-    func firstTimeSetupPairsFromOneScan() async throws {
+    func firstTimeSetupWithoutATokenPairsFromOneScan() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let phone = makeUnsetModel("Phone", token: "")
+        defer { phone.goOffline() }
+        phone.pair(using: PairingLink(code: PairingCode().display, server: server.url.absoluteString))
+        #expect(phone.pairingStatus == .waiting) // no question first
+        #expect(phone.serverURL == server.url.absoluteString)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func firstTimeSetupWithATokenAsksThenPairs() async throws {
         let server = try await LocalServer.start()
         defer { server.stop() }
         let studio = makeModel("Studio", server: server), phone = makeUnsetModel("Phone")
@@ -292,11 +303,33 @@ struct BridgeModelTests {
         let code = try #require(shownCode(studio))
         try await Task.sleep(for: .milliseconds(200))
 
+        // The token was entered with no server: a link must not take it without a yes.
         phone.pair(using: PairingLink(code: code, server: server.url.absoluteString))
-        #expect(phone.pairingStatus == .waiting) // no question first
+        #expect(phone.pairingStatus == .confirmServer(server.url.absoluteString, sendsToken: true))
+        #expect(phone.serverURL == "")
+        phone.confirmServerSwitch()
         try await poll("paired") { studio.paired.count == 1 && phone.paired.count == 1 }
         #expect(phone.serverURL == server.url.absoluteString)
         #expect(phone.accessToken == LocalServer.token)
+    }
+
+    @Test func anUnusableServerWithATokenStillAsks() throws {
+        let suite = "macbridge-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let secrets = SecretStore.inMemory()
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets)
+        model.applyConnectionSettings(server: "wss://a.example.com", token: "token-a")
+        // The field cleared, or left half-typed: the token stays on screen with no server.
+        model.applyConnectionSettings(server: "not a server", token: nil)
+        #expect(model.accessToken == "token-a" && !model.canGoOnline)
+
+        model.pair(using: PairingLink(code: PairingCode().display, server: "ws://127.0.0.1:1"))
+        #expect(model.pairingStatus == .confirmServer("ws://127.0.0.1:1", sendsToken: true))
+        #expect(model.serverURL == "not a server")
+        model.cancelPairing()
+        #expect(model.serverURL == "not a server" && secrets.token("ws://127.0.0.1:1") == "")
+        #expect(secrets.token("wss://a.example.com") == "token-a")
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -310,7 +343,7 @@ struct BridgeModelTests {
 
         let link = PairingLink(code: PairingCode().display, server: other.url.absoluteString)
         phone.pair(using: link)
-        #expect(phone.pairingStatus == .confirmServer(other.url.absoluteString))
+        #expect(phone.pairingStatus == .confirmServer(other.url.absoluteString, sendsToken: false))
         #expect(phone.serverURL == server.url.absoluteString)
         #expect(phone.accessToken == LocalServer.token)
         #expect(phone.signalingStatus == .online)
@@ -345,21 +378,23 @@ struct BridgeModelTests {
         #expect(secrets.token("wss://a.example.com") == "old-single-token")
         #expect(secrets.token("") == "")
 
-        // Typing a new address in Settings moves the token along, keystroke by keystroke.
-        model.serverURL = "wss://b"
-        model.serverURL = "WSS://B.example.com/"
+        // Committing another server in Settings loads its own token; neither server loses its own.
+        secrets.setToken("token-b", "wss://b.example.com:8443")
+        model.applyConnectionSettings(server: "wss://B.example.com:8443/", token: nil)
+        #expect(model.accessToken == "token-b")
+        #expect(secrets.token("wss://a.example.com") == "old-single-token")
+        model.applyConnectionSettings(server: "wss://a.example.com", token: nil)
         #expect(model.accessToken == "old-single-token")
-        #expect(secrets.token("wss://b") == "" && secrets.token("wss://a.example.com") == "")
-        #expect(secrets.token("wss://b.example.com") == "old-single-token")
+        #expect(secrets.token("wss://b.example.com:8443") == "token-b")
 
-        // A server that has its own token gets that one, and the one left keeps its own.
-        secrets.setToken("token-c", "wss://c.example.com")
-        model.serverURL = "wss://c.example.com"
-        #expect(model.accessToken == "token-c")
-        model.serverURL = "wss://b.example.com"
+        // A new server gets a copy of the token shown; the old one keeps it.
+        model.applyConnectionSettings(server: "wss://c.example.com", token: nil)
         #expect(model.accessToken == "old-single-token")
+        #expect(secrets.token("wss://a.example.com") == "old-single-token")
+        model.applyConnectionSettings(server: "wss://c.example.com", token: "token-c")
         #expect(secrets.token("wss://c.example.com") == "token-c")
-        #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets).accessToken == "old-single-token")
+        #expect(secrets.token("wss://a.example.com") == "old-single-token")
+        #expect(BridgeModel(identity: Identity(), defaults: defaults, secrets: secrets).accessToken == "token-c")
     }
 
     @Test func pairedDevicesSurviveARestart() throws {

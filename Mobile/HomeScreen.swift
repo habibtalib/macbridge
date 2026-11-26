@@ -21,6 +21,8 @@ struct HomeScreen: View {
     @State private var filter: MobileDeviceFilter = .all
     @State private var showsSettings = false
     @State private var showsScanner = false
+    /// Read by the scanner; acted on once its sheet is gone, so a question it raises can show.
+    @State private var scannedLink: PairingLink?
 
     private var input: ConnectInput {
         ConnectInput.parse(query, devices: model.controllable, names: model.displayNames)
@@ -91,12 +93,15 @@ struct HomeScreen: View {
                 }
             }
             .sheet(isPresented: $showsSettings) { SettingsScreen() }
-            .sheet(isPresented: $showsScanner) {
+            .sheet(isPresented: $showsScanner, onDismiss: {
+                if let link = scannedLink { model.pair(using: link) }
+                scannedLink = nil
+            }) {
                 ZStack(alignment: .top) {
                     CodeScanner { link in
-                        showsScanner = false
+                        scannedLink = link
                         query = link.code
-                        model.pair(using: link)
+                        showsScanner = false
                     }
                     .ignoresSafeArea()
                     HStack {
@@ -183,7 +188,13 @@ struct HomeScreen: View {
                         .accessibilityLabel("Scan the pairing code on your Mac")
                 }
             }
-            if case let .failed(reason) = model.pairingStatus {
+            if let confirm = model.pairingStatus.serverToConfirm {
+                Text(confirm.message).font(.callout).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Use \(confirm.host)") { model.confirmServerSwitch() }.buttonStyle(.borderedProminent)
+                    Button("Cancel") { query = ""; model.cancelPairing() }.buttonStyle(.bordered)
+                }
+            } else if case let .failed(reason) = model.pairingStatus {
                 Text(reason).font(.callout).foregroundStyle(.red)
             } else if case .pairingCode = input {
                 Text("That looks like a pairing code. Pair to add the Mac that shows it.").font(.callout).foregroundStyle(.secondary)

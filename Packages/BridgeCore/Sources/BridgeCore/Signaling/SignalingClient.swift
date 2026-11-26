@@ -44,6 +44,8 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
         /// The server refused the login (wrong access token or key). The
         /// client stops reconnecting; retrying cannot succeed.
         case unauthorized(String)
+        /// The server does not know a message of this type. It stays connected.
+        case unsupported(String)
         case other(String)
     }
 
@@ -227,8 +229,7 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
             presenceWaiters.removeAll()
             waiters.forEach { $0(Set(online)) }
         case let .error(error):
-            let unsupported = error == .other("unsupported")
-            if error == .other("bad-message") || unsupported, !presenceWaiters.isEmpty {
+            if error == .other("bad-message") || error == .unsupported("presence"), !presenceWaiters.isEmpty {
                 // The server does not know the request. An older one closes the connection; the
                 // reconnect that follows must not ask again.
                 presenceUnsupported = true
@@ -237,8 +238,8 @@ public final class SignalingClient: NSObject, URLSessionWebSocketDelegate, @unch
                 waiters.forEach { $0(nil) }
                 return
             }
-            // A newer server says it does not know a message and stays connected: nothing to show.
-            if unsupported { return }
+            // The server does not know some other message and stays connected: nothing to show.
+            if case .unsupported = error { return }
             if case .unauthorized = error { stop() }
             DispatchQueue.main.async { self.onError?(error) }
         }
@@ -352,7 +353,7 @@ private enum Incoming: Decodable {
     case pairReply(from: String, sealed: Data)
     case error(SignalingClient.ServerError)
 
-    private enum CodingKeys: String, CodingKey { case type, nonce, from, data, servers, code, to, online }
+    private enum CodingKeys: String, CodingKey { case type, nonce, from, data, servers, code, to, online, messageType }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -389,6 +390,8 @@ private enum Incoming: Decodable {
                 self = .error(.noSuchPairing)
             case "bad-token", "bad-auth", "bad-id":
                 self = .error(.unauthorized(code))
+            case "unsupported":
+                self = .error(.unsupported(try c.decodeIfPresent(String.self, forKey: .messageType) ?? ""))
             default:
                 self = .error(.other(code))
             }

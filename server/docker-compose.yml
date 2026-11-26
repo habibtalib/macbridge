@@ -15,8 +15,9 @@ services:
       TURN_URLS: ${TURN_URLS:?set TURN_URLS in .env}
       STUN_URLS: ${STUN_URLS:-}
       # Only the reverse proxy reaches this service (see ports), so the client address it
-      # forwards is the one to count connections by.
+      # appends to X-Forwarded-For is the one to count connections by. The proxy must set it.
       TRUST_PROXY: ${TRUST_PROXY:-1}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-}
       RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-}
       MAX_BUFFERED_BYTES: ${MAX_BUFFERED_BYTES:-}
