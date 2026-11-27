@@ -10,8 +10,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "6"
+    MARKETING_VERSION: "0.1.2"
+    CURRENT_PROJECT_VERSION: "7"
     # Screen Recording and Accessibility grants are tied to the code signature,
     # so builds must be signed with a stable identity, never ad hoc.
     # Your Apple team ID, from the environment: DEVELOPMENT_TEAM=XXXXXXXXXX xcodegen generate

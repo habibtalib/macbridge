@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-11-27
+
+### Fixed
+- Mac: the paired Mac tiles were not drawn when the main window opened (only after resizing it or switching the filter). Present since 0.1.0 on some systems.
+
 ## 0.1.1 — 2026-11-26
 
 An audit release: security, stability and connection fixes. Mac and server should both be updated.
