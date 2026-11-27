@@ -30,7 +30,7 @@ Peer-to-peer screen and input over WebRTC, end-to-end signed, with a tiny server
 - ⚡ **Hardware H.264.** Retina-sized screens at up to 60 fps, with Sharp, Balanced and Light presets.
 - 📋 **Feels local.** Mouse, keyboard, ⌘ shortcuts, two-way clipboard, desktop switching, multiple displays.
 - 😴 **Always reachable.** Opens at login, stays awake while control is allowed, even with the lid closed (via [LidAwake](https://github.com/habibtalib/lidawake)).
-- 📱 **iPhone and iPad.** Touch or trackpad pointer, pinch zoom, on-screen and hardware keyboard.
+- 📱 **iPhone, iPad and Vision Pro.** Touch or trackpad pointer, pinch zoom, on-screen and hardware keyboard. Vision Pro runs the iPad app.
 - 🏠 **Self-hosted.** One Node service plus an optional TURN relay, Docker Compose included. Works great over Tailscale.
 
 ## How it works
@@ -131,6 +131,15 @@ open MacBridge.xcodeproj      # choose the MacBridgeMobile scheme and your devic
 - **More menu:** desktops, Mission Control, Spotlight, switch app, copy screenshot, lock, quality, connection details, and the clipboard: *Send Clipboard to Mac* and *Get Mac's Clipboard* (manual, because iOS asks for permission on every automatic read).
 - Pointer mode and quality changed during a session last for that session. The defaults are in Settings.
 - The screen stays on during a session. The session ends when the app goes to the background. Coming back offers to reconnect, and the call waits until the device is online again.
+
+### Apple Vision Pro
+
+The iPad app runs on Vision Pro as a compatible iPad app ("Designed for iPad"), in its own window. Install it from TestFlight or the App Store once it's listed for Vision Pro, or run the **MacBridgeMobile** scheme from Xcode with a paired Vision Pro.
+
+- **Add a Mac:** type the pairing code and tap **Pair**. Scanning a QR code isn't available, since apps can't use the Vision Pro cameras.
+- **Pointer:** Touch mode works with look and pinch: look where you want to click and pinch. Pinch and hold, then move, to drag. A paired Bluetooth trackpad or mouse moves the pointer directly.
+- **Keyboard:** the on-screen keyboard and a paired Bluetooth keyboard both work.
+- There's no native visionOS build yet: the WebRTC framework MacBridge uses has no visionOS version.
 
 ## Security
 
