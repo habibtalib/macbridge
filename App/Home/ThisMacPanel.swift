@@ -99,7 +99,15 @@ struct ThisMacPanel: View {
                 }
             case .connecting:
                 ProgressView().controlSize(.mini)
-                Text("Connecting…").foregroundStyle(.secondary)
+                Text(model.isOnLocalNetwork ? "Local network · connecting to server…" : "Connecting…")
+                    .foregroundStyle(.secondary).lineLimit(1)
+            case .offline where model.isOnLocalNetwork:
+                Circle().fill(.green).frame(width: 8, height: 8)
+                Text("Local network only").foregroundStyle(.secondary)
+                Spacer()
+                if model.canGoOnline {
+                    Button("Go online") { model.goOnline() }.controlSize(.small)
+                }
             case .offline:
                 Circle().fill(Color.secondary.opacity(0.5)).frame(width: 8, height: 8)
                 Text("Offline").foregroundStyle(.secondary)

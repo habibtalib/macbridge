@@ -335,7 +335,7 @@ private struct DeviceGrid: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
-                .disabled(model.signalingStatus != .online)
+                .disabled(!model.isReachable)
                 .help("Refresh which Macs are online")
             }
 
@@ -396,7 +396,7 @@ private struct DeviceTile: View {
 
     private var meta: DeviceMeta { model.meta[device.id] ?? DeviceMeta() }
     private var isCalling: Bool { model.controllerStatus == .calling(device) }
-    private var canConnect: Bool { model.signalingStatus == .online }
+    private var canConnect: Bool { model.canConnect(to: device) }
     private var isOnline: Bool? { model.presence[device.id] }
 
     var body: some View {

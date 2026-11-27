@@ -31,7 +31,7 @@ final class MobileLaunch: ObservableObject {
         let firstRun = UserDefaults.standard.string(forKey: "deviceName") == nil
         model = (try? Identity.loadOrCreate()).map { BridgeModel(identity: $0) }
         if firstRun { model?.deviceName = BridgeModel.defaultDeviceName(from: UIDevice.current.name) }
-        if let model, model.canGoOnline { model.goOnline() }
+        if let model, model.hasSomewhereToGo { model.goOnline() }
     }
 }
 

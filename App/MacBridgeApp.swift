@@ -57,7 +57,7 @@ final class Launch: ObservableObject {
         model = (try? Identity.loadOrCreate()).map { BridgeModel(identity: $0) }
         // Online from launch, window or not: after a login-item start nobody
         // is there to click anything.
-        if let model, model.canGoOnline { model.goOnline() }
+        if let model, model.hasSomewhereToGo { model.goOnline() }
         panels = model.map(HostPanels.init)
         if let model {
             // Neither a session, with keys the controller holds down, nor a hold on
@@ -271,12 +271,12 @@ private struct MenuBarContent: View {
                         // The Mac already on screen is only brought forward.
                         if model.sessionHost?.id != device.id { model.connect(to: device) }
                     } label: {
-                        // Menus draw text only: the dot says what the server last reported.
+                        // Menus draw text only: the dot says what the server or this network last reported.
                         Text((model.presence[device.id] == true ? "● " : model.presence[device.id] == false ? "○ " : "") + model.displayName(device))
                     }
                 }
             }
-            .disabled(model.signalingStatus != .online)
+            .disabled(!model.isReachable)
         }
         Toggle("Allow This Mac to Be Controlled", isOn: $model.allowsControl)
         Button("Copy This Mac's Address") {
@@ -301,8 +301,10 @@ private struct MenuBarContent: View {
 
     private var statusLine: String {
         switch model.signalingStatus {
+        case .offline where model.isOnLocalNetwork:
+            return model.allowsControl ? "Local network only, can be controlled" : "Local network only"
         case .offline: return "Offline"
-        case .connecting: return "Connecting…"
+        case .connecting: return model.isOnLocalNetwork ? "Local network; connecting to server…" : "Connecting…"
         case .online: return model.allowsControl ? "Online, can be controlled" : "Online"
         }
     }

@@ -27,5 +27,11 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_macbridge._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MacBridge finds your paired Macs and devices on the same network, so they can connect without the server.</string>
 </dict>
 </plist>

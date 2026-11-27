@@ -7,11 +7,11 @@ import Testing
 @MainActor
 struct BridgeModelTests {
     /// A model with its own settings and key, as if on a separate Mac.
-    private func makeModel(_ name: String, server: LocalServer, token: String = LocalServer.token) -> BridgeModel {
+    private func makeModel(_ name: String, server: LocalServer, token: String = LocalServer.token, local: Bool = false) -> BridgeModel {
         let suite = "macbridge-tests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory(token))
+        let model = BridgeModel(identity: Identity(), defaults: defaults, secrets: .inMemory(token), usesLocalNetwork: local)
         model.serverURL = server.url.absoluteString
         model.deviceName = name
         return model
@@ -157,8 +157,8 @@ struct BridgeModelTests {
     }
 
     /// Studio shows a code, Laptop types it: Laptop may control Studio.
-    private func pairedModels(_ server: LocalServer) async throws -> (studio: BridgeModel, laptop: BridgeModel) {
-        let studio = makeModel("Studio", server: server), laptop = makeModel("Laptop", server: server)
+    private func pairedModels(_ server: LocalServer, local: Bool = false) async throws -> (studio: BridgeModel, laptop: BridgeModel) {
+        let studio = makeModel("Studio", server: server, local: local), laptop = makeModel("Laptop", server: server, local: local)
         studio.goOnline(); laptop.goOnline()
         try await poll("both online") { studio.signalingStatus == .online && laptop.signalingStatus == .online }
         studio.showPairingCode()
@@ -186,6 +186,60 @@ struct BridgeModelTests {
         laptop.goOffline()
         laptop.refreshPresence()
         #expect(laptop.presence.isEmpty)
+    }
+
+    /// Paired over the server, then the server goes away (Tailscale off, server down): the two
+    /// still find each other on this network and the call goes through. Opt-in, like the other
+    /// Bonjour test: it advertises on the local network.
+    @Test(.timeLimit(.minutes(1)), .enabled(if: ProcessInfo.processInfo.environment["MACBRIDGE_BONJOUR_TEST"] == "1"))
+    func callsGoThroughOnTheLocalNetworkWithoutTheServer() async throws {
+        let server = try await LocalServer.start()
+        let (studio, laptop) = try await pairedModels(server, local: true)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.allowsControl = true
+        studio.setAsksFirst(try #require(studio.controllers.first), true)
+        server.stop()
+        studio.goOnline(); laptop.goOnline()
+        try await poll("found on the network") { laptop.nearby == [studio.deviceID] && studio.nearby == [laptop.deviceID] }
+        #expect(laptop.signalingStatus != .online)
+        #expect(laptop.presence[studio.deviceID] == true)
+        #expect(studio.power.keepSystemAwake)
+
+        let studioAtLaptop = try #require(laptop.controllable.first)
+        #expect(laptop.canConnect(to: studioAtLaptop))
+        laptop.connect(to: studioAtLaptop)
+        try await poll("studio asks") { studio.pendingRequest?.peer.id == laptop.deviceID }
+        studio.declineRequest()
+        try await poll("laptop told") {
+            if case let .failed(message) = laptop.controllerStatus { return message.contains("did not accept") }
+            return false
+        }
+
+        // Going offline leaves the network too.
+        studio.goOffline()
+        try await poll("studio gone") { laptop.nearby.isEmpty && laptop.presence[studio.deviceID] != true }
+    }
+
+    /// Relay only, but the server offers no relay: the call fails at once with the reason,
+    /// instead of a session that can never connect (a dark screen).
+    @Test(.timeLimit(.minutes(1)))
+    func relayOnlyWithoutARelayFailsWithTheReason() async throws {
+        let server = try await LocalServer.start()
+        defer { server.stop() }
+        let (studio, laptop) = try await pairedModels(server)
+        defer { studio.goOffline(); laptop.goOffline() }
+        studio.allowsControl = true
+        laptop.forcesRelay = true
+        laptop.connect(to: try #require(laptop.controllable.first))
+        try await poll("failed with the reason") { laptop.controllerStatus == .failed(BridgeModel.noRelayMessage) }
+        #expect(studio.hostStatus == .idle)
+    }
+
+    @Test func relayMeansTurn() {
+        #expect(!BridgeModel.hasRelay([]))
+        #expect(!BridgeModel.hasRelay([IceServer(urls: ["stun:turn.example.com:3478"])]))
+        #expect(BridgeModel.hasRelay([IceServer(urls: ["stun:x:3478", "turn:x:3478?transport=udp"])]))
+        #expect(BridgeModel.hasRelay([IceServer(urls: ["TURNS:x:5349"])]))
     }
 
     @Test(.timeLimit(.minutes(1)))

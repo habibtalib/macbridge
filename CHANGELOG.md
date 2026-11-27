@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-11-27
+
+### Added
+- Local network: paired devices on the same network find each other with Bonjour and connect without the server, for example with Tailscale off. Both sides prove their paired key before anything is exchanged; setup messages go straight to the device when it is on the network and through the server otherwise. Pairing still needs the server. The status reads "Local network only" when only the local network is reachable.
+
+### Fixed
+- "Always relay through the server" with a server that has no TURN relay left a dark screen: the call now fails at once and says why, and a Mac being controlled with that setting connects directly instead.
+
 ## 0.1.2 — 2026-11-27
 
 ### Fixed

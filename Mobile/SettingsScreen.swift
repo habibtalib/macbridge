@@ -28,7 +28,10 @@ struct SettingsScreen: View {
                     SecureField("Access token", text: $tokenDraft)
                         .focused($focused, equals: .token)
                         .onSubmit(commit)
-                    Toggle("Always relay through the server", isOn: $model.forcesRelay)
+                    Toggle(isOn: $model.forcesRelay) {
+                        Text("Always relay through the server")
+                        Text("Needs a TURN relay on the server; without one, leave it off.")
+                    }
                     HStack {
                         switch model.signalingStatus {
                         case .offline: Label("Offline", systemImage: "circle").foregroundStyle(.secondary)

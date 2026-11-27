@@ -230,7 +230,14 @@ struct HomeScreen: View {
                 Text("Online").foregroundStyle(.secondary)
             case .connecting:
                 ProgressView().controlSize(.small)
-                Text("Connecting…").foregroundStyle(.secondary)
+                Text(model.isOnLocalNetwork ? "Local network · connecting to server…" : "Connecting…").foregroundStyle(.secondary)
+            case .offline where model.isOnLocalNetwork:
+                Circle().fill(.green).frame(width: 9, height: 9)
+                Text("Local network only").foregroundStyle(.secondary)
+                Spacer()
+                if model.canGoOnline {
+                    Button("Go online") { model.goOnline() }.buttonStyle(.bordered)
+                }
             case .offline:
                 Circle().fill(Color.secondary.opacity(0.5)).frame(width: 9, height: 9)
                 Text("Offline").foregroundStyle(.secondary)
@@ -361,7 +368,7 @@ private struct DeviceCard: View {
     @State private var thumbnail: UIImage?
 
     private var meta: DeviceMeta { model.meta[device.id] ?? DeviceMeta() }
-    private var canConnect: Bool { model.signalingStatus == .online }
+    private var canConnect: Bool { model.canConnect(to: device) }
     private var isOnline: Bool? { model.presence[device.id] }
 
     var body: some View {

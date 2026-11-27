@@ -70,6 +70,7 @@ public final class BridgeModel: ObservableObject {
                 declineRequest()
                 endHosting(notify: true)
             }
+            local?.setAdvertising(advertisesLocally)
             updatePower()
         }
     }
@@ -88,8 +89,18 @@ public final class BridgeModel: ObservableObject {
     @Published public private(set) var paired: [PairedDevice] = []
     /// Alias, favourite and last use per paired device, by device ID.
     @Published public private(set) var meta: [String: DeviceMeta] = [:]
-    /// Which paired devices are connected to the server right now. A device missing here is unknown.
+    /// Which paired devices are online right now, on the server or on this network. A device
+    /// missing here is unknown.
     @Published public private(set) var presence: [String: Bool] = [:]
+    /// What the server last said about presence.
+    private var serverPresence: [String: Bool] = [:]
+    /// Paired devices reachable on this network without the server.
+    @Published public private(set) var nearby: Set<String> = [] {
+        didSet {
+            updatePresence()
+            if let host = hostAwaitingServer, nearby.contains(host.id) { connect(to: host) }
+        }
+    }
     @Published public private(set) var signalingStatus: SignalingClient.Status = .offline {
         didSet {
             updatePower()
@@ -141,6 +152,10 @@ public final class BridgeModel: ObservableObject {
     private let defaults: UserDefaults
     private let secrets: SecretStore
     private var signaling: SignalingClient?
+    /// Session setup with paired devices on the same network; runs while this device is online,
+    /// with or without a server.
+    private var local: LocalLink?
+    private let usesLocalNetwork: Bool
 
     private var controllerSession: PeerSession?
     private var controllerPeer: PairedDevice?
@@ -171,9 +186,12 @@ public final class BridgeModel: ObservableObject {
     private var typedCode: PairingCode?
     private var pairingTimeout: Task<Void, Never>?
 
+    /// - Parameter usesLocalNetwork: find paired devices on this network too (off in most tests,
+    ///   which would otherwise advertise on the network and find each other there).
     public init(identity: Identity, defaults: UserDefaults = .standard, secrets: SecretStore = .keychain,
-                lidKeeper: LidClosedKeeper? = nil) {
+                lidKeeper: LidClosedKeeper? = nil, usesLocalNetwork: Bool = true) {
         self.identity = identity
+        self.usesLocalNetwork = usesLocalNetwork
         self.lidKeeper = lidKeeper ?? LidClosedKeeper()
         lidClosedMode = defaults.string(forKey: Keys.lidClosedMode).flatMap(LidClosedMode.init) ?? .off
         self.defaults = defaults
@@ -240,9 +258,21 @@ public final class BridgeModel: ObservableObject {
     public func resumeConnection() {
         if let signaling {
             signaling.reconnectIfStale()
-        } else if !staysOffline, signalingStatus == .offline, canGoOnline {
+        } else if !staysOffline, local == nil, hasSomewhereToGo {
             goOnline()
         }
+    }
+
+    /// Online in some way: connected (or connecting) to the server, or reachable on this network.
+    private var isActive: Bool { signaling != nil || local != nil }
+
+    /// Only a Mac that accepts control needs to be found on the network.
+    private var advertisesLocally: Bool {
+        #if os(macOS)
+        allowsControl
+        #else
+        false
+        #endif
     }
 
     /// Offline on purpose (Go offline) or because the server turned this device away (wrong
@@ -253,11 +283,11 @@ public final class BridgeModel: ObservableObject {
     /// While this Mac accepts control and is meant to be online, it must not
     /// fall asleep, or it would drop off the server.
     private func updatePower() {
-        power.keepSystemAwake = allowsControl && signaling != nil
+        power.keepSystemAwake = allowsControl && isActive
         updateLidHold()
         // The power adapter may be unplugged, and a hold has to be renewed: look again every minute
         // for as long as a hold could be wanted.
-        let watch = hasLid && lidClosedMode != .off && allowsControl && signaling != nil
+        let watch = hasLid && lidClosedMode != .off && allowsControl && isActive
         if watch, lidTimer == nil {
             lidTimer = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
@@ -274,7 +304,7 @@ public final class BridgeModel: ObservableObject {
     private func updateLidHold() {
         guard hasLid else { return }
         lidKeeper.update(shouldHold: lidClosedMode.shouldHold(
-            allowsControl: allowsControl, isOnline: signaling != nil,
+            allowsControl: allowsControl, isOnline: isActive,
             isOnPower: LidAndPower.isOnPowerAdapter, inSession: hostSession != nil))
     }
 
@@ -287,6 +317,10 @@ public final class BridgeModel: ObservableObject {
     /// The server the current connection uses. Until going online again, the one in Settings may differ.
     public var connectedServerURL: URL? { signaling?.url }
     public var canGoOnline: Bool { parsedServerURL != nil }
+    /// A server to reach, or paired devices to find on this network: worth going online for at launch.
+    public var hasSomewhereToGo: Bool { canGoOnline || !paired.isEmpty }
+    /// Looking for paired devices on this network (online, with or without the server).
+    public var isOnLocalNetwork: Bool { local != nil }
     /// Devices this Mac can control.
     public var controllable: [PairedDevice] { paired.filter(\.thisMacMayControl) }
     /// Devices that can control this Mac.
@@ -296,17 +330,32 @@ public final class BridgeModel: ObservableObject {
     public func refreshPresence() {
         let ids = paired.map(\.id)
         guard let signaling, signalingStatus == .online, !ids.isEmpty else {
-            if !presence.isEmpty { presence = [:] }
-            return
+            serverPresence = [:]
+            return updatePresence()
         }
         signaling.presence(of: ids) { [weak self] online in
             Task { @MainActor in
                 guard let self else { return }
-                let fresh = online.map { online in Dictionary(uniqueKeysWithValues: ids.map { ($0, online.contains($0)) }) } ?? [:]
-                if fresh != self.presence { self.presence = fresh }
+                self.serverPresence = online.map { online in Dictionary(uniqueKeysWithValues: ids.map { ($0, online.contains($0)) }) } ?? [:]
+                self.updatePresence()
             }
         }
     }
+
+    /// The server's answer plus the devices found on this network.
+    private func updatePresence() {
+        var merged = serverPresence
+        for id in nearby where paired.contains(where: { $0.id == id }) { merged[id] = true }
+        if merged != presence { presence = merged }
+    }
+
+    /// A call can start: over the server, or straight to a device on this network.
+    public func canConnect(to device: PairedDevice) -> Bool {
+        signalingStatus == .online || nearby.contains(device.id)
+    }
+
+    /// Reachable in some way: the server answers, or a paired device is on this network.
+    public var isReachable: Bool { signalingStatus == .online || !nearby.isEmpty }
 
     // MARK: - Names, favourites, last use
 
@@ -357,7 +406,8 @@ public final class BridgeModel: ObservableObject {
     public func goOnline() {
         goOffline()
         staysOffline = false
-        guard let url = parsedServerURL else { return }
+        startLocal()
+        guard let url = parsedServerURL else { return updatePower() }
         let client = SignalingClient(url: url, identity: identity, accessToken: accessToken)
         // Callbacks queued by a client that has since been replaced (going offline, another
         // server) are dropped: a late "offline" must not overwrite the new client's status.
@@ -395,13 +445,34 @@ public final class BridgeModel: ObservableObject {
         signaling?.disconnect()
         signaling = nil
         signalingStatus = .offline
+        local?.stop()
+        local = nil
+        nearby = []
         updatePower()
     }
 
+    private func startLocal() {
+        guard usesLocalNetwork else { return }
+        let link = LocalLink(identity: identity)
+        link.onSignal = { [weak self, weak link] from, envelope in
+            guard let self, self.local === link else { return }
+            self.receive(envelope, from: from)
+        }
+        link.onPeers = { [weak self, weak link] peers in
+            guard let self, self.local === link else { return }
+            self.nearby = peers
+        }
+        local = link
+        link.start(peers: paired, advertise: advertisesLocally)
+    }
+
     private func send(_ payload: SignalPayload, to peer: PairedDevice, reason: ByeReason? = nil) {
-        PeerSession.writeStats("signal out to \(peer.name): \(PeerSession.kind(payload)) (server \(signaling == nil ? "none" : "ok"))")
         let auth = SessionAuth.sign(payload, to: peer.id, identity: identity)
-        signaling?.send(SignalEnvelope(payload, auth: auth, reason: reason), to: peer.id)
+        let envelope = SignalEnvelope(payload, auth: auth, reason: reason)
+        // Straight to the device when it is on this network; through the server otherwise.
+        let direct = local?.send(envelope, to: peer.id) == true
+        PeerSession.writeStats("signal out to \(peer.name): \(PeerSession.kind(payload)) (\(direct ? "local network" : signaling == nil ? "no server" : "server"))")
+        if !direct { signaling?.send(envelope, to: peer.id) }
     }
 
     /// Turns a request away with a reason the caller can show.
@@ -478,7 +549,8 @@ public final class BridgeModel: ObservableObject {
         case .noSuchPairing:
             failPairing("No Mac is showing that code. Check it and try again.")
         case let .unauthorized(code):
-            // The client has stopped for good: let go of it, and of the wake lock held for it.
+            // The client has stopped for good: let go of it, and of the wake lock held for it
+            // unless paired devices can still reach this Mac on the local network.
             cancelWaitingConnect()
             staysOffline = true
             signaling = nil
@@ -491,6 +563,11 @@ public final class BridgeModel: ObservableObject {
             staysOffline = true
             signaling = nil
             signalingStatus = .offline
+            // The other copy has the same identity: two of them on this network would compete too.
+            local?.stop()
+            local = nil
+            nearby = []
+            updatePower()
             #if os(macOS)
             notice = "This Mac is online from another copy of MacBridge. Go online again here to take over."
             #else
@@ -729,6 +806,8 @@ public final class BridgeModel: ObservableObject {
 
     private func savePaired() {
         defaults.set(try? JSONEncoder().encode(paired), forKey: Keys.paired)
+        local?.setPeers(paired)
+        updatePresence()
     }
 
     // MARK: - Controlling another Mac
@@ -741,7 +820,7 @@ public final class BridgeModel: ObservableObject {
             if hostAwaitingServer?.id == host.id { cancelWaitingConnect() }
             return
         }
-        guard signalingStatus == .online else { return connectOnceOnline(host) }
+        guard canConnect(to: host) else { return connectOnceOnline(host) }
         cancelWaitingConnect()
         disconnect()
         controllerPeer = host
@@ -751,6 +830,11 @@ public final class BridgeModel: ObservableObject {
         Task {
             let servers = await iceServers()
             guard controllerPeer == host, controllerSession == nil else { return } // cancelled meanwhile
+            // Relay only, with no relay to use: nothing could connect, and the screen would stay dark.
+            if forcesRelay, !Self.hasRelay(servers) {
+                send(.bye, to: host)
+                return endControlling(.failed(Self.noRelayMessage))
+            }
             startControlling(host, iceServers: servers)
         }
     }
@@ -758,17 +842,17 @@ public final class BridgeModel: ObservableObject {
     private func connectOnceOnline(_ host: PairedDevice) {
         // Asked again for the Mac already waited for: the wait goes on as it was.
         if hostAwaitingServer?.id == host.id { return }
-        if signaling == nil {
-            guard canGoOnline else { return }
-            goOnline()
-        }
+        if !isActive { goOnline() }
+        guard isActive else { return }
         cancelWaitingConnect()
         hostAwaitingServer = host
         hostAwaitingTimeout = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(20))
             guard !Task.isCancelled, let self, self.hostAwaitingServer != nil else { return }
             self.cancelWaitingConnect()
-            self.notice = "Could not connect to \(self.displayName(host)): the server did not answer."
+            self.notice = self.signaling == nil
+                ? "Could not connect to \(self.displayName(host)): it isn't on this network and no server is set up."
+                : "Could not connect to \(self.displayName(host)): the server did not answer and it isn't on this network."
         }
     }
 
@@ -1019,7 +1103,12 @@ public final class BridgeModel: ObservableObject {
         hostPeer = peer
         let servers = await iceServers()
         guard hostPeer == peer, hostSession == nil else { return }
-        guard let session = PeerSession(role: .host, iceServers: servers, relayOnly: forcesRelay) else {
+        // This Mac set to relay only, with no relay to use: connect directly rather than not at all.
+        let relayOnly = forcesRelay && Self.hasRelay(servers)
+        if forcesRelay, !relayOnly {
+            PeerSession.writeStats("relay only is on but the server offers no relay: connecting directly")
+        }
+        guard let session = PeerSession(role: .host, iceServers: servers, relayOnly: relayOnly) else {
             notice = "Could not start a session for \(peer.name)."
             return endHosting(notify: true)
         }
@@ -1482,6 +1571,14 @@ public final class BridgeModel: ObservableObject {
             }
         }
     }
+
+    /// The server offered a TURN relay (STUN alone cannot relay).
+    nonisolated static func hasRelay(_ servers: [IceServer]) -> Bool {
+        servers.contains { $0.urls.contains { $0.lowercased().hasPrefix("turn:") || $0.lowercased().hasPrefix("turns:") } }
+    }
+
+    nonisolated static let noRelayMessage =
+        "\"Always relay through the server\" is on, but the server has no relay (TURN). Turn it off in Settings → Connection, or set up the relay on the server."
 
     nonisolated public static func parseServerURL(_ text: String) -> URL? {
         let trimmed = text.trimmingCharacters(in: .whitespaces)

@@ -10,8 +10,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.2"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "0.1.3"
+    CURRENT_PROJECT_VERSION: "8"
     # Screen Recording and Accessibility grants are tied to the code signature,
     # so builds must be signed with a stable identity, never ad hoc.
     # Your Apple team ID, from the environment: DEVELOPMENT_TEAM=XXXXXXXXXX xcodegen generate
@@ -40,6 +40,9 @@ targets:
         # use wss://, or the access token is sent in the clear.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Paired devices on the same network find each other with Bonjour, without the server.
+        NSLocalNetworkUsageDescription: MacBridge finds your paired Macs and devices on the same network, so they can connect without the server.
+        NSBonjourServices: [_macbridge._tcp]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.habibtalib.macbridge
@@ -69,6 +72,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: MacBridge connects straight to your Mac when both are on the same network.
+        NSBonjourServices: [_macbridge._tcp]
         NSCameraUsageDescription: MacBridge uses the camera to scan the pairing code shown on your Mac.
         # Only standard encryption (WebRTC's DTLS-SRTP), exempt under US export rules; skips the
         # export compliance question in App Store Connect for each build.

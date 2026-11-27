@@ -32,6 +32,7 @@ Peer-to-peer screen and input over WebRTC, end-to-end signed, with a tiny server
 - 😴 **Always reachable.** Opens at login, stays awake while control is allowed, even with the lid closed (via [LidAwake](https://github.com/habibtalib/lidawake)).
 - 📱 **iPhone, iPad and Vision Pro.** Touch or trackpad pointer, pinch zoom, on-screen and hardware keyboard. Vision Pro runs the iPad app.
 - 🏠 **Self-hosted.** One Node service plus an optional TURN relay, Docker Compose included. Works great over Tailscale.
+- 📶 **Same network, no server needed.** Paired Macs and devices on the same Wi-Fi or LAN find each other directly, so they still connect when the server is unreachable (for example with Tailscale off).
 
 ## How it works
 
@@ -47,6 +48,8 @@ Peer-to-peer screen and input over WebRTC, end-to-end signed, with a tiny server
 1. Both Macs log in to your signaling server with the access token and their own key.
 2. Pair once: the Mac to be controlled shows a code or QR code, the other Mac types or scans it.
 3. Connecting sends a signed offer and answer through the server; then screen, input and clipboard flow directly between the Macs (relayed through TURN only when a direct path is impossible).
+
+On the same network the server is optional once paired. A Mac that allows control announces itself on the local network with Bonjour, and paired devices connect to it directly and prove who they are with their paired keys. When both sides are on the same network, the setup messages go that way; otherwise they go through the server. Pairing a new device still needs the server. The status shows **Local network only** while the server can't be reached. The first time, macOS and iOS ask to allow local network access: allow it.
 
 Status: early; used between Macs on a private network (Tailscale), not yet tried over the open internet.
 
@@ -144,6 +147,8 @@ The iPad app runs on Vision Pro as a compatible iPad app ("Designed for iPad"), 
 ## Security
 
 Each install has an Ed25519 key in the keychain; its device ID is derived from the key. The server checks the access token and that a device holds its key, and nothing more. A session starts only when a paired device sends a signed, fresh request, and both sides sign the certificate fingerprints of the encrypted connection, so the server cannot read, alter or start a session. See the end of [docs/server-setup.md](docs/server-setup.md) for what a compromised server could still do.
+
+On the local network, a device must prove it holds the key of a device paired with this one before anything else is exchanged: each side signs a random challenge from the other. A device that was never paired is disconnected after the challenge. The setup messages carry the same signatures as through the server. Bonjour does show the device IDs of the Macs that allow control to anyone on the same network.
 
 ## Limits
 

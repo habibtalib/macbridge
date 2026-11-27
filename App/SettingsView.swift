@@ -181,7 +181,7 @@ private struct ConnectionSettings: View {
                     .onSubmit(commit)
                 Toggle("Always relay through the server", isOn: $model.forcesRelay)
             } footer: {
-                Text("The server only introduces the two Macs. Changes apply the next time this Mac goes online.")
+                Text("The server only introduces the two Macs. Relaying needs a TURN relay on the server; without one, leave it off. Changes apply the next time this Mac goes online.")
             }
             Section {
                 HStack {
