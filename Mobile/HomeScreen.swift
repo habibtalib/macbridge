@@ -331,7 +331,10 @@ struct HomeScreen: View {
             Text("No Macs yet").font(.title3.weight(.semibold))
             step(1, "On the Mac, open MacBridge and turn on Allow control.")
             step(2, "There, tap Show pairing code.")
-            step(3, "Here, scan the code or type it in the field above, then tap Pair.")
+            // No camera scanning here (Vision Pro, a simulator): the code is typed.
+            step(3, DataScannerViewController.isSupported
+                 ? "Here, scan the code or type it in the field above, then tap Pair."
+                 : "Here, type the code in the field above, then tap Pair.")
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)

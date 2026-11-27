@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Improved
+- iPhone, iPad and Vision Pro: where the camera cannot scan codes (Vision Pro), the first-run steps say to type the pairing code instead of scanning it.
+
 ## 0.1.3 — 2026-11-27
 
 ### Added
